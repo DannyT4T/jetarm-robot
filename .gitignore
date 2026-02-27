@@ -1,0 +1,27 @@
+# Dependencies
+node_modules/
+
+# Next.js
+jetarm-dashboard/.next/
+jetarm-dashboard/out/
+
+# Environment
+.env
+.env.local
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Logs
+*.log
+
+# Build
+dist/
+build/
