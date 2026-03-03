@@ -24,7 +24,7 @@ export async function POST(req: NextRequest) {
 
     switch (action) {
         case 'start_yolo': {
-            // Kill existing instance, then start YOLO detector
+            // Kill existing instance, then start TensorRT YOLO detector
             await ssh("pkill -9 -f yolo_detector || true");
             await new Promise(r => setTimeout(r, 1000));
             const startScriptB64 = Buffer.from(
@@ -36,14 +36,14 @@ export async function POST(req: NextRequest) {
                 "export FASTRTPS_DEFAULT_PROFILES_FILE=/home/danny/disable_shm.xml\n" +
                 "nohup python3 /home/danny/yolo_detector.py > /home/danny/yolo.log 2>&1 &\n"
             ).toString('base64');
-            const result = await ssh(
+            await ssh(
                 `bash -c 'echo "${startScriptB64}" | base64 --decode > /home/danny/start_yolo.sh && bash /home/danny/start_yolo.sh'`
             );
-            await new Promise(r => setTimeout(r, 3000));
-            const check = await ssh("tail -3 /home/danny/yolo.log 2>/dev/null || echo 'No log yet'");
+            await new Promise(r => setTimeout(r, 5000));
+            const check = await ssh("tail -5 /home/danny/yolo.log 2>/dev/null || echo 'No log yet'");
             return NextResponse.json({
                 success: true,
-                message: 'YOLO detector starting...',
+                message: 'YOLO TensorRT detector starting...',
                 log: check.output,
             });
         }
@@ -61,12 +61,104 @@ export async function POST(req: NextRequest) {
                 const logResult = await ssh("tail -5 /home/danny/yolo.log 2>/dev/null");
                 log = logResult.output;
             }
+            // Also check vision HTTP endpoint
+            let visionState = null;
+            try {
+                const vRes = await fetch('http://192.168.1.246:8889/state', { signal: AbortSignal.timeout(1000) });
+                visionState = await vRes.json();
+            } catch { /* vision HTTP not available */ }
             return NextResponse.json({
                 success: true,
                 running: count > 0,
-                message: count > 0 ? 'YOLO detector is running' : 'YOLO detector is not running',
+                message: count > 0 ? 'YOLO TensorRT is running' : 'YOLO detector is not running',
                 log,
+                vision: visionState,
             });
+        }
+
+        // ── YOLO v2 TensorRT Actions ──────────────────────────────────────────
+        case 'start_yolo_v2': {
+            await ssh("pkill -9 -f yolo_detector_v2 || true");
+            await new Promise(r => setTimeout(r, 1000));
+            const v2ScriptB64 = Buffer.from(
+                "source /opt/ros/humble/setup.bash\n" +
+                "source /home/danny/JetArm/install/setup.bash\n" +
+                "export CUDA_HOME=/usr/local/cuda-12.6\n" +
+                "export PATH=$CUDA_HOME/bin:$PATH\n" +
+                "export LD_LIBRARY_PATH=$CUDA_HOME/lib64:$LD_LIBRARY_PATH\n" +
+                "export FASTRTPS_DEFAULT_PROFILES_FILE=/home/danny/disable_shm.xml\n" +
+                "nohup python3 /home/danny/yolo_detector_v2.py > /home/danny/yolo_v2.log 2>&1 &\n"
+            ).toString('base64');
+            await ssh(
+                `bash -c 'echo "${v2ScriptB64}" | base64 --decode > /home/danny/start_yolo_v2.sh && bash /home/danny/start_yolo_v2.sh'`
+            );
+            await new Promise(r => setTimeout(r, 5000));
+            const v2check = await ssh("tail -5 /home/danny/yolo_v2.log 2>/dev/null || echo 'Starting...'");
+            return NextResponse.json({
+                success: true,
+                message: 'YOLO v2 TensorRT starting...',
+                log: v2check.output,
+            });
+        }
+
+        case 'stop_yolo_v2': {
+            await ssh("pkill -9 -f yolo_detector_v2 || true");
+            return NextResponse.json({ success: true, message: 'YOLO v2 stopped' });
+        }
+
+        case 'yolo_v2_status': {
+            const v2running = await ssh("ps aux | grep -v grep | grep yolo_detector_v2 | wc -l");
+            const v2count = parseInt(v2running.output.trim()) || 0;
+            let v2log = '';
+            if (v2count > 0) {
+                const v2logResult = await ssh("tail -5 /home/danny/yolo_v2.log 2>/dev/null");
+                v2log = v2logResult.output;
+            }
+            // Also try to get vision state from HTTP
+            let visionState = null;
+            try {
+                const vRes = await fetch('http://192.168.1.246:8889/state', { signal: AbortSignal.timeout(1000) });
+                visionState = await vRes.json();
+            } catch { /* v2 HTTP not available */ }
+            return NextResponse.json({
+                success: true,
+                running: v2count > 0,
+                message: v2count > 0 ? 'YOLO v2 TensorRT is running' : 'YOLO v2 is not running',
+                log: v2log,
+                vision: visionState,
+            });
+        }
+
+        case 'export_tensorrt': {
+            // Export TensorRT engine (takes 2-5 min first time)
+            const exportScript = Buffer.from(
+                "source /opt/ros/humble/setup.bash\n" +
+                "source /home/danny/JetArm/install/setup.bash\n" +
+                "export CUDA_HOME=/usr/local/cuda-12.6\n" +
+                "export PATH=$CUDA_HOME/bin:$PATH\n" +
+                "export LD_LIBRARY_PATH=$CUDA_HOME/lib64:$LD_LIBRARY_PATH\n" +
+                "python3 /home/danny/yolo_detector_v2.py --export-only 2>&1\n"
+            ).toString('base64');
+            const exportResult = await ssh(
+                `bash -c 'echo "${exportScript}" | base64 --decode > /home/danny/export_trt.sh && bash /home/danny/export_trt.sh'`,
+                300000 // 5 minute timeout for export
+            );
+            return NextResponse.json({
+                success: exportResult.success,
+                message: exportResult.success ? 'TensorRT engine exported!' : 'Export failed',
+                log: exportResult.output,
+            });
+        }
+
+        case 'get_vision': {
+            // Instant query to YOLO v2 HTTP endpoint
+            try {
+                const vRes = await fetch('http://192.168.1.246:8889/state', { signal: AbortSignal.timeout(1000) });
+                const vision = await vRes.json();
+                return NextResponse.json({ success: true, vision });
+            } catch {
+                return NextResponse.json({ success: false, message: 'YOLO v2 vision server not available (port 8889)' });
+            }
         }
 
         case 'install_yolo': {

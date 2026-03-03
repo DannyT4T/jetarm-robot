@@ -29,13 +29,14 @@ const BASE_PROMPT = `You are JetArm AI — the intelligent brain of a HiWonder J
 | 5 | Wrist rotate | Twist wrist |
 | 10 | Gripper | 100=closed, 500=open |
 
-## SPEED RULES — BE FAST!
-1. **Default duration: 300ms** for small moves (< 200 pulse change)
-2. **Use 500ms** for medium moves (200-400 pulse change)
-3. **Use 800ms max** for large moves (> 400 pulse change)
-4. **NEVER use more than 1000ms** — it feels sluggish
+## SPEED RULES
+The joystick controller moves at 40ms micro-steps. Since you send single big moves, use longer durations:
+1. **Default duration: 1000ms** — matches the joystick feel for normal moves
+2. **Use 800ms** for small moves (< 100 pulse change)
+3. **Use 1500ms** for large moves (> 300 pulse change)
+4. **Use 500ms** for gripper open/close
 5. Move ALL relevant servos in ONE move_arm call
-6. For gestures (wave, nod), use 200-400ms for snappy feel
+6. For gestures (wave, nod), use 600-800ms per step
 7. When asked what you see, ALWAYS use look — never guess
 8. Keep responses concise and action-oriented`;
 
@@ -88,10 +89,10 @@ export async function POST(req: Request) {
                             id: z.number().describe('Servo ID: 1=base, 2=shoulder, 3=elbow, 4=wrist, 5=wrist_rotate, 10=gripper'),
                             position: z.number().min(0).max(1000).describe('Target position 0-1000 (500=center)'),
                         })).describe('Array of servo positions to set simultaneously'),
-                        duration: z.number().min(100).max(2000).default(300).describe('Movement duration in ms. 300=fast, 500=smooth, 800=slow. NEVER over 1000.'),
+                        duration: z.number().min(200).max(5000).default(1000).describe('Movement duration in ms. 800=fast, 1000=normal, 1500=slow/safe.'),
                     }),
                     execute: async ({ positions, duration }: { positions: { id: number; position: number }[]; duration: number }) => {
-                        const data = await callAI('move_arm', { positions, duration: duration || 300 });
+                        const data = await callAI('move_arm', { positions, duration: duration || 1000 });
                         return { success: data.success, message: data.message };
                     },
                 },
@@ -103,10 +104,10 @@ export async function POST(req: Request) {
                         y: z.number().describe('Left/right in meters (-0.15 to 0.15, 0=center)'),
                         z: z.number().describe('Height in meters (0.02-0.35, 0.10=low, 0.25=high)'),
                         pitch: z.number().default(-90).describe('Gripper pitch angle in degrees (-90=pointing down, 0=horizontal)'),
-                        duration: z.number().min(200).max(2000).default(500).describe('Duration ms. 500=fast, 800=smooth.'),
+                        duration: z.number().min(500).max(5000).default(1200).describe('Duration ms. 1000=normal, 1500=smooth.'),
                     }),
                     execute: async ({ x, y, z, pitch, duration }: { x: number; y: number; z: number; pitch: number; duration: number }) => {
-                        const data = await callAI('move_to_xyz', { x, y, z, pitch: pitch || -90, duration: duration || 500 });
+                        const data = await callAI('move_to_xyz', { x, y, z, pitch: pitch || -90, duration: duration || 1200 });
                         return { success: data.success, message: data.message, pulses: data.pulses };
                     },
                 },
@@ -116,10 +117,10 @@ export async function POST(req: Request) {
                     inputSchema: z.object({
                         servo_id: z.number().min(1).max(10).describe('Servo ID'),
                         position: z.number().min(0).max(1000).describe('Position 0-1000'),
-                        duration: z.number().min(100).max(2000).default(300).describe('Duration ms'),
+                        duration: z.number().min(200).max(5000).default(1000).describe('Duration ms'),
                     }),
                     execute: async ({ servo_id, position, duration }: { servo_id: number; position: number; duration: number }) => {
-                        const data = await callAI('move_servo', { servo_id, position, duration: duration || 300 });
+                        const data = await callAI('move_servo', { servo_id, position, duration: duration || 1000 });
                         return { success: data.success, message: data.message };
                     },
                 },
@@ -131,7 +132,7 @@ export async function POST(req: Request) {
                     }),
                     execute: async ({ state }: { state: 'open' | 'close' }) => {
                         const position = state === 'open' ? 500 : 100;
-                        const data = await callAI('move_servo', { servo_id: 10, position, duration: 300 });
+                        const data = await callAI('move_servo', { servo_id: 10, position, duration: 500 });
                         return { success: data.success, message: `Gripper ${state}ed` };
                     },
                 },

@@ -64,10 +64,13 @@ class JetArmBridge(Node):
                 'goal': s.goal, 'voltage': s.voltage
             }
 
-    def move_servos(self, positions, duration=1000):
-        """Move servos via bus (direct hardware control)."""
+    def move_servos(self, positions, duration_ms=500):
+        """Move servos via bus (direct hardware control).
+        duration_ms: duration in milliseconds from dashboard.
+        ROS SDK expects SECONDS (it internally multiplies by 1000).
+        """
         msg = BusServosPosition()
-        msg.duration = float(duration)
+        msg.duration = float(duration_ms / 1000.0)  # Convert ms → seconds
         for p in positions:
             sp = BusServoPosition()
             sp.id = int(p['id'])
@@ -81,7 +84,7 @@ class JetArmBridge(Node):
         if not self.ik_client.wait_for_service(timeout_sec=2.0):
             return None
         req = set_pose_target([x, y, z], pitch, [-90.0, 90.0], 1.0)
-        req.duration = float(duration)
+        req.duration = float(duration / 1000.0)  # Convert ms → seconds
         future = self.ik_client.call_async(req)
         rclpy.spin_until_future_complete(self, future, timeout_sec=3.0)
         if future.done() and future.result():
@@ -118,14 +121,14 @@ class BridgeHandler(BaseHTTPRequestHandler):
         try:
             if action == 'move_arm':
                 positions = body.get('positions', [])
-                duration = body.get('duration', 1000)
+                duration = body.get('duration', 500)
                 node.move_servos(positions, duration)
                 result = {'success': True, 'message': f'Moved {len(positions)} servos ({duration}ms)'}
 
             elif action == 'move_servo':
                 sid = body.get('servo_id', 1)
                 pos = body.get('position', 500)
-                dur = body.get('duration', 1000)
+                dur = body.get('duration', 500)
                 node.move_servos([{'id': sid, 'position': pos}], dur)
                 result = {'success': True, 'message': f'Servo {sid} → {pos} ({dur}ms)'}
 
@@ -142,7 +145,7 @@ class BridgeHandler(BaseHTTPRequestHandler):
                     result = {'success': False, 'message': 'IK solution not found'}
 
             elif action == 'home':
-                dur = body.get('duration', 1500)
+                dur = body.get('duration', 500)
                 positions = [{'id': i, 'position': 500} for i in [1,2,3,4,5,10]]
                 node.move_servos(positions, dur)
                 result = {'success': True, 'message': f'Home ({dur}ms)'}

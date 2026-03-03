@@ -14,11 +14,12 @@ import {
 
 const JETSON_IP = "192.168.1.246";
 const STORAGE_KEY = "jetarm-dashboard-layout";
-const LAYOUT_VERSION = 5; // Bump this when default system tabs change
+const LAYOUT_VERSION = 7; // Bump this when default system tabs change
 
 // ─── Types ───────────────────────────────────────────────────────────────────
 type ModuleType = 'rgb_feed' | 'depth_feed' | 'gamepad_visualizer' | 'telemetry' | 'control_scheme' | 'system_controls'
-    | 'ai_detection_feed' | 'ai_detections_log' | 'ai_controls' | 'ai_chat' | 'voice_assistant';
+    | 'ai_detection_feed' | 'ai_detections_log' | 'ai_controls' | 'ai_chat' | 'voice_assistant'
+    | 'vision_v2_controls' | 'vision_v2_state';
 
 interface YoloDetection {
     class: string; confidence: number;
@@ -59,6 +60,8 @@ const MODULE_REGISTRY: Record<ModuleType, { name: string; icon: string; desc: st
     ai_controls: { name: 'YOLO Controls', icon: '🚀', desc: 'Start/Stop YOLO detector' },
     ai_chat: { name: 'AI Chat', icon: '💬', desc: 'Chat with JetArm AI — control the robot with language' },
     voice_assistant: { name: 'Voice Assistant', icon: '🎤', desc: 'Talk to the robot — voice commands + spoken responses' },
+    vision_v2_controls: { name: 'Vision v2 Controls', icon: '🚀', desc: 'TensorRT-accelerated YOLO v2 — start/stop/export' },
+    vision_v2_state: { name: 'Vision v2 State', icon: '👁️', desc: 'Real-time vision detections from TensorRT YOLO' },
 };
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
@@ -78,15 +81,12 @@ const defaultLayout: DashboardLayout = {
         { id: 'home', name: 'Home', isSystem: true, modules: DEFAULT_HOME_MODULES },
         {
             id: 'yolo', name: 'YOLO', isSystem: true, modules: [
-                { id: uid(), type: 'ai_controls' },
+                { id: uid(), type: 'vision_v2_controls' },
                 { id: uid(), type: 'ai_detection_feed' },
-                { id: uid(), type: 'ai_detections_log' },
+                { id: uid(), type: 'vision_v2_state' },
                 { id: uid(), type: 'rgb_feed' },
                 { id: uid(), type: 'depth_feed' },
                 { id: uid(), type: 'telemetry' },
-                { id: uid(), type: 'gamepad_visualizer' },
-                { id: uid(), type: 'control_scheme' },
-                { id: uid(), type: 'system_controls' },
             ]
         },
         {
@@ -96,9 +96,6 @@ const defaultLayout: DashboardLayout = {
                 { id: uid(), type: 'rgb_feed' },
                 { id: uid(), type: 'depth_feed' },
                 { id: uid(), type: 'telemetry' },
-                { id: uid(), type: 'gamepad_visualizer' },
-                { id: uid(), type: 'control_scheme' },
-                { id: uid(), type: 'system_controls' },
             ]
         },
     ],
@@ -988,6 +985,180 @@ function AIControlsWidget() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
+// VISION V2 — TensorRT Controls Widget
+// ═══════════════════════════════════════════════════════════════════════════════
+function VisionV2ControlsWidget() {
+    const [loading, setLoading] = useState<string | null>(null);
+    const [logs, setLogs] = useState<string[]>([]);
+    const [v2Running, setV2Running] = useState(false);
+
+    const addLog = (msg: string) => setLogs(prev => [...prev.slice(-8), `[${new Date().toLocaleTimeString('en-US', { hour12: false })}] ${msg}`]);
+
+    useEffect(() => {
+        (async () => {
+            try {
+                const res = await fetch('/api/ai', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ action: 'yolo_v2_status' }) });
+                const data = await res.json();
+                if (data.success) setV2Running(data.running);
+            } catch { }
+        })();
+    }, []);
+
+    const runAction = async (action: string, label: string) => {
+        setLoading(action);
+        addLog(`⏳ ${label}...`);
+        try {
+            const res = await fetch('/api/ai', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ action }) });
+            const data = await res.json();
+            addLog(data.success ? `✅ ${data.message}` : `❌ ${data.error || data.message || 'Failed'}`);
+            if (data.log) addLog(`📋 ${data.log}`);
+            if (action === 'yolo_v2_status') {
+                setV2Running(data.running);
+                if (data.vision) addLog(`👁️ Vision: ${data.vision.count} objects, ${data.vision.fps} FPS, ${data.vision.inference_ms}ms`);
+            }
+            if (action === 'start_yolo_v2') setV2Running(true);
+            if (action === 'stop_yolo_v2') setV2Running(false);
+        } catch (e) {
+            addLog('❌ Network error');
+        }
+        setLoading(null);
+    };
+
+    return (
+        <div className="bg-slate-900 border border-slate-800 rounded-2xl p-6 shadow-xl">
+            <div className="flex items-center space-x-3 mb-2">
+                <span className="text-2xl">🚀</span>
+                <h2 className="text-xl font-semibold">YOLO v2 — TensorRT</h2>
+                <span className={`text-xs px-2.5 py-1 rounded-full font-semibold ${v2Running ? 'bg-emerald-600/30 text-emerald-400 animate-pulse' : 'bg-slate-700 text-slate-500'}`}>
+                    {v2Running ? '● TensorRT Active' : '○ Inactive'}
+                </span>
+            </div>
+            <p className="text-xs text-slate-500 mb-4">YOLOv8n + TensorRT FP16 — up to 100+ FPS on Orin Nano Super</p>
+
+            <div className="flex flex-wrap gap-2 mb-4">
+                <button onClick={() => runAction('export_tensorrt', 'Exporting TensorRT engine (2-5 min)')} disabled={!!loading}
+                    className="flex items-center space-x-2 px-4 py-2.5 bg-amber-600 hover:bg-amber-500 disabled:opacity-50 disabled:cursor-wait transition-colors text-white rounded-lg text-sm font-semibold shadow-lg shadow-amber-600/20">
+                    <span>🔧</span><span>{loading === 'export_tensorrt' ? 'Exporting...' : 'Export Engine'}</span>
+                </button>
+                <button onClick={() => runAction('start_yolo_v2', 'Starting YOLO v2 TensorRT')} disabled={!!loading}
+                    className="flex items-center space-x-2 px-4 py-2.5 bg-purple-600 hover:bg-purple-500 disabled:opacity-50 disabled:cursor-wait transition-colors text-white rounded-lg text-sm font-semibold shadow-lg shadow-purple-600/20">
+                    <span>🧠</span><span>{loading === 'start_yolo_v2' ? 'Starting...' : 'Start v2'}</span>
+                </button>
+                <button onClick={() => runAction('stop_yolo_v2', 'Stopping YOLO v2')} disabled={!!loading}
+                    className="flex items-center space-x-2 px-4 py-2.5 bg-red-600/80 hover:bg-red-500 disabled:opacity-50 disabled:cursor-wait transition-colors text-white rounded-lg text-sm font-semibold">
+                    <PowerOff size={16} /><span>{loading === 'stop_yolo_v2' ? 'Stopping...' : 'Stop v2'}</span>
+                </button>
+                <button onClick={() => runAction('yolo_v2_status', 'Checking v2 status')} disabled={!!loading}
+                    className="flex items-center space-x-2 px-3 py-2.5 bg-slate-700 hover:bg-slate-600 disabled:opacity-50 disabled:cursor-wait transition-colors text-white rounded-lg text-sm font-semibold">
+                    <span>{loading === 'yolo_v2_status' ? '⏳' : '🔍'}</span><span>Status</span>
+                </button>
+            </div>
+
+            {logs.length > 0 && (
+                <div className="bg-slate-950 border border-slate-800 rounded-lg p-3 max-h-40 overflow-auto">
+                    <div className="flex justify-end space-x-2 mb-2">
+                        <button onClick={() => setLogs([])} className="text-[10px] px-2 py-0.5 bg-slate-800 hover:bg-slate-700 text-slate-400 rounded transition-colors">Clear</button>
+                    </div>
+                    <div className="space-y-1 text-xs font-mono text-slate-400">
+                        {logs.map((log, i) => (<div key={i} className={log.includes('❌') ? 'text-red-400' : log.includes('✅') ? 'text-emerald-400' : log.includes('👁️') ? 'text-blue-400' : ''}>{log}</div>))}
+                    </div>
+                </div>
+            )}
+        </div>
+    );
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// VISION V2 — Live State Widget (polls HTTP endpoint)
+// ═══════════════════════════════════════════════════════════════════════════════
+function VisionV2StateWidget() {
+    const [vision, setVision] = useState<{ fps: number; inference_ms: number; count: number; objects: any[] } | null>(null);
+    const [error, setError] = useState(false);
+
+    useEffect(() => {
+        const poll = async () => {
+            try {
+                const res = await fetch('/api/ai', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ action: 'get_vision' }) });
+                const data = await res.json();
+                if (data.success && data.vision) {
+                    setVision(data.vision);
+                    setError(false);
+                } else {
+                    setError(true);
+                }
+            } catch { setError(true); }
+        };
+        poll();
+        const interval = setInterval(poll, 2000);
+        return () => clearInterval(interval);
+    }, []);
+
+    return (
+        <div className="bg-slate-900 border border-slate-800 rounded-2xl p-5 shadow-xl">
+            <div className="flex items-center justify-between mb-4">
+                <div className="flex items-center space-x-3">
+                    <span className="text-2xl">👁️</span>
+                    <h2 className="text-xl font-semibold">Vision v2 State</h2>
+                    {vision && (
+                        <>
+                            <span className="text-xs bg-purple-600/30 text-purple-300 px-2 py-1 rounded-full font-bold">{vision.fps} FPS</span>
+                            <span className="text-xs bg-blue-600/30 text-blue-300 px-2 py-1 rounded-full font-bold">{vision.inference_ms}ms</span>
+                            <span className="text-xs bg-emerald-600/30 text-emerald-400 px-2 py-1 rounded-full font-bold">{vision.count} obj</span>
+                        </>
+                    )}
+                </div>
+            </div>
+
+            {error && !vision ? (
+                <div className="text-center py-8 text-slate-600">
+                    <span className="text-3xl opacity-30">👁️</span>
+                    <p className="mt-2 text-sm">YOLO v2 not running — start it from the controls above</p>
+                </div>
+            ) : vision && vision.objects.length > 0 ? (
+                <div className="overflow-auto max-h-64 rounded-lg border border-slate-800">
+                    <table className="w-full text-sm">
+                        <thead className="bg-slate-800/50 sticky top-0">
+                            <tr className="text-slate-400 text-left">
+                                <th className="px-3 py-2">Object</th>
+                                <th className="px-3 py-2">Confidence</th>
+                                <th className="px-3 py-2">Depth</th>
+                                <th className="px-3 py-2">Position</th>
+                                <th className="px-3 py-2">Size</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            {vision.objects.map((det: any, i: number) => (
+                                <tr key={i} className="border-t border-slate-800/50 hover:bg-slate-800/30">
+                                    <td className="px-3 py-2 font-semibold text-white">{det.class}</td>
+                                    <td className="px-3 py-2">
+                                        <span className={`px-2 py-0.5 rounded text-xs font-bold ${det.confidence > 0.8 ? 'bg-emerald-600/30 text-emerald-400' : det.confidence > 0.5 ? 'bg-yellow-600/30 text-yellow-400' : 'bg-red-600/30 text-red-400'}`}>
+                                            {(det.confidence * 100).toFixed(1)}%
+                                        </span>
+                                    </td>
+                                    <td className="px-3 py-2 font-mono text-blue-300">{det.depth_mm > 0 ? `${det.depth_mm}mm` : '—'}</td>
+                                    <td className="px-3 py-2 font-mono text-slate-400 text-xs">{det.center_px[0]}, {det.center_px[1]}</td>
+                                    <td className="px-3 py-2 font-mono text-slate-400 text-xs">{det.size_px[0]}×{det.size_px[1]}</td>
+                                </tr>
+                            ))}
+                        </tbody>
+                    </table>
+                </div>
+            ) : vision ? (
+                <div className="text-center py-8 text-slate-600">
+                    <span className="text-3xl opacity-30">✅</span>
+                    <p className="mt-2 text-sm">Running at {vision.fps} FPS — no objects in view</p>
+                </div>
+            ) : (
+                <div className="text-center py-8 text-slate-600">
+                    <span className="text-3xl opacity-30 animate-spin">⏳</span>
+                    <p className="mt-2 text-sm">Connecting to vision server...</p>
+                </div>
+            )}
+        </div>
+    );
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
 // MODULE RENDERER (dispatches to correct widget)
 // ═══════════════════════════════════════════════════════════════════════════════
 function ModuleContent({ type, shared }: { type: ModuleType; shared: SharedState }) {
@@ -1199,6 +1370,10 @@ function ModuleContent({ type, shared }: { type: ModuleType; shared: SharedState
             return <AIChatWidget />;
         case 'voice_assistant':
             return <VoiceAssistantWidget />;
+        case 'vision_v2_controls':
+            return <VisionV2ControlsWidget />;
+        case 'vision_v2_state':
+            return <VisionV2StateWidget />;
     }
 }
 
