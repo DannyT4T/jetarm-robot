@@ -60,6 +60,25 @@ async function getServoContext(): Promise<string> {
     return '';
 }
 
+// Fetch real-time YOLO detections (with depth) from TensorRT vision server
+async function getVisionContext(): Promise<string> {
+    try {
+        const res = await fetch('http://192.168.1.246:8889/state', {
+            signal: AbortSignal.timeout(1000),
+        });
+        const data = await res.json();
+        if (data.objects && data.objects.length > 0) {
+            const objs = data.objects.map((o: any) =>
+                `- ${o.class} (${(o.confidence * 100).toFixed(0)}%) at pixel[${o.center_px[0]},${o.center_px[1]}]${o.depth_mm > 0 ? ` depth:${o.depth_mm}mm` : ''} size:${o.size_px[0]}x${o.size_px[1]}px`
+            ).join('\n');
+            return `\n\n## What I Can See Right Now (YOLO TensorRT ${data.fps} FPS)\n${objs}\n\nUse depth_mm to estimate distance. Objects at 80-280mm are within arm reach.`;
+        }
+        return '\n\n## Vision: No objects detected in view';
+    } catch {
+        return '\n\n## Vision: YOLO not running';
+    }
+}
+
 async function callAI(action: string, params: Record<string, any> = {}) {
     const res = await fetch(AI_API, {
         method: 'POST',
@@ -74,8 +93,12 @@ export async function POST(req: Request) {
         const { messages: uiMessages } = await req.json() as { messages: UIMessage[] };
         const modelMessages = await convertToModelMessages(uiMessages);
 
-        const servoContext = await getServoContext();
-        const systemPrompt = BASE_PROMPT + servoContext;
+        // Fetch both servo state AND vision state in parallel
+        const [servoContext, visionContext] = await Promise.all([
+            getServoContext(),
+            getVisionContext(),
+        ]);
+        const systemPrompt = BASE_PROMPT + servoContext + visionContext;
 
         const result = streamText({
             model: ollama('qwen2.5:7b'),

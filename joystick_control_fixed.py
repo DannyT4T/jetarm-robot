@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 # encoding: utf-8
 import os
+import json
 import math
 import time
 import rclpy
@@ -52,6 +53,21 @@ BUTTON_MAP = [
     'mode',        # 12 - MODE
 ]
 
+# ─── SAFETY LIMITS — Enforced on ALL gamepad servo commands ───────────────────
+SERVO_LIMITS = {
+    1:  (0,   1000),  # Base rotation
+    2:  (450, 1000),  # Shoulder (⚠️ broken gear: min 450)
+    3:  (0,   1000),  # Elbow
+    4:  (0,   1000),  # Wrist pitch
+    5:  (0,   1000),  # Wrist rotate
+    10: (50,  600),   # Gripper
+}
+
+def clamp_servo(servo_id, value):
+    """Clamp a servo position to its safety limits"""
+    lo, hi = SERVO_LIMITS.get(servo_id, (0, 1000))
+    return max(lo, min(hi, int(value)))
+
 class ButtonState(Enum):
     Normal = 0
     Pressed = 1
@@ -70,6 +86,7 @@ class JoystickController(Node):
         self.current_servo_position = np.array([500]*6) # 1,2,3,4,5,10
         self.servos_pub = self.create_publisher(ServosPosition, '/servo_controller', 1)
         self.joy_pub = self.create_publisher(Joy, '/joy', 5)
+        self.estop_active = False  # 🛑 Emergency stop flag
         
         try:
             self.chassis_type = os.environ['CHASSIS_TYPE']
@@ -90,6 +107,7 @@ class JoystickController(Node):
         # Proactively center the arm at startup
         bus_servo_control.set_servo_position(self.servos_pub, 1.0, ((1, 500), (2, 500), (3, 500), (4, 500), (5, 500), (10, 500)))
         self.get_logger().info('Joystick Control: ZD-V+ mapping active — L1/L2=Wrist, R1/R2=Gripper, Sticks=Arm')
+        self.get_logger().info(f'Safety limits: {SERVO_LIMITS}')
 
     def servo_states_callback(self, msg):
         pos = []
@@ -99,50 +117,72 @@ class JoystickController(Node):
             self.current_servo_position = np.array(pos)
 
     def axes_callback(self, axes):
+        if self.estop_active:
+            return
         lx, ly, rx, ry = axes['lx'], axes['ly'], axes['rx'], axes['ry']
         
         if self.mode == 0: # Manual Servo Mode
             # LX: Base (ID1)
             if abs(lx) > self.min_value:
-                new_pos = int(self.current_servo_position[0] + lx * 15)
+                new_pos = clamp_servo(1, self.current_servo_position[0] + lx * 15)
                 bus_servo_control.set_servo_position(self.servos_pub, 0.04, ((1, new_pos),))
             # LY: Shoulder (ID2)
             if abs(ly) > self.min_value:
-                new_pos = int(self.current_servo_position[1] + ly * 15)
+                new_pos = clamp_servo(2, self.current_servo_position[1] + ly * 15)
                 bus_servo_control.set_servo_position(self.servos_pub, 0.04, ((2, new_pos),))
             # RY: Elbow (ID3)
             if abs(ry) > self.min_value:
-                new_pos = int(self.current_servo_position[2] + ry * 15)
+                new_pos = clamp_servo(3, self.current_servo_position[2] + ry * 15)
                 bus_servo_control.set_servo_position(self.servos_pub, 0.04, ((3, new_pos),))
             # RX: Wrist Pitch (ID4)
             if abs(rx) > self.min_value:
-                new_pos = int(self.current_servo_position[3] + rx * 15)
+                new_pos = clamp_servo(4, self.current_servo_position[3] + rx * 15)
                 bus_servo_control.set_servo_position(self.servos_pub, 0.04, ((4, new_pos),))
 
     def l1_callback(self, state): # Wrist Rotate CCW
+        if self.estop_active: return
         if state in [ButtonState.Pressed, ButtonState.Holding]:
-            new_pos = int(self.current_servo_position[4] + 25)
+            new_pos = clamp_servo(5, self.current_servo_position[4] + 25)
             bus_servo_control.set_servo_position(self.servos_pub, 0.05, ((5, new_pos),))
 
     def l2_callback(self, state): # Wrist Rotate CW
+        if self.estop_active: return
         if state in [ButtonState.Pressed, ButtonState.Holding]:
-            new_pos = int(self.current_servo_position[4] - 25)
+            new_pos = clamp_servo(5, self.current_servo_position[4] - 25)
             bus_servo_control.set_servo_position(self.servos_pub, 0.05, ((5, new_pos),))
 
     def r1_callback(self, state): # Gripper Open
+        if self.estop_active: return
         if state in [ButtonState.Pressed, ButtonState.Holding]:
-            new_pos = int(self.current_servo_position[5] + 35)
-            new_pos = min(new_pos, 1000)
+            new_pos = clamp_servo(10, self.current_servo_position[5] + 35)
             bus_servo_control.set_servo_position(self.servos_pub, 0.05, ((10, new_pos),))
 
     def r2_callback(self, state): # Gripper Close
+        if self.estop_active: return
         if state in [ButtonState.Pressed, ButtonState.Holding]:
-            new_pos = int(self.current_servo_position[5] - 35)
-            new_pos = max(new_pos, 0)
+            new_pos = clamp_servo(10, self.current_servo_position[5] - 35)
             bus_servo_control.set_servo_position(self.servos_pub, 0.05, ((10, new_pos),))
+
+    def select_callback(self, state):
+        """🛑 EMERGENCY STOP — SELECT button freezes all servos"""
+        if state == ButtonState.Pressed:
+            self.estop_active = True
+            # Hold current positions immediately
+            pos = self.current_servo_position
+            servo_ids = [1, 2, 3, 4, 5, 10]
+            positions = tuple((sid, int(pos[i])) for i, sid in enumerate(servo_ids))
+            bus_servo_control.set_servo_position(self.servos_pub, 0.0, positions)
+            self.buzzer_pub.set_buzzer(1000, 0.1, 0.0, 1)  # Single soft beep
+            self.get_logger().warn('🛑 EMERGENCY STOP — all servos frozen. Press START to resume.')
 
     def start_callback(self, state):
         if state == ButtonState.Pressed:
+            if self.estop_active:
+                # Resume from emergency stop
+                self.estop_active = False
+                self.buzzer_pub.set_buzzer(1000, 0.1, 0.1, 2)  # Double beep
+                self.get_logger().info('✅ Emergency stop cleared — gamepad re-enabled')
+                return
             if self.last_buttons.get('select', 0): # Toggle Mode
                 self.mode = 1 if self.mode == 0 else 0
                 self.buzzer_pub.set_buzzer(1000, 0.1, 0.5, self.mode + 1)

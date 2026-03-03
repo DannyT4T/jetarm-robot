@@ -14,12 +14,13 @@ import {
 
 const JETSON_IP = "192.168.1.246";
 const STORAGE_KEY = "jetarm-dashboard-layout";
-const LAYOUT_VERSION = 7; // Bump this when default system tabs change
+const LAYOUT_VERSION = 10; // Bump this when default system tabs change
 
 // ─── Types ───────────────────────────────────────────────────────────────────
 type ModuleType = 'rgb_feed' | 'depth_feed' | 'gamepad_visualizer' | 'telemetry' | 'control_scheme' | 'system_controls'
     | 'ai_detection_feed' | 'ai_detections_log' | 'ai_controls' | 'ai_chat' | 'voice_assistant'
-    | 'vision_v2_controls' | 'vision_v2_state';
+    | 'vision_v2_controls' | 'vision_v2_state' | 'autonomy'
+    | 'overhead_feed' | 'overhead_detection_feed';
 
 interface YoloDetection {
     class: string; confidence: number;
@@ -62,6 +63,9 @@ const MODULE_REGISTRY: Record<ModuleType, { name: string; icon: string; desc: st
     voice_assistant: { name: 'Voice Assistant', icon: '🎤', desc: 'Talk to the robot — voice commands + spoken responses' },
     vision_v2_controls: { name: 'Vision v2 Controls', icon: '🚀', desc: 'TensorRT-accelerated YOLO v2 — start/stop/export' },
     vision_v2_state: { name: 'Vision v2 State', icon: '👁️', desc: 'Real-time vision detections from TensorRT YOLO' },
+    autonomy: { name: 'Autonomy', icon: '🤖', desc: 'Autonomous sense→think→act loop' },
+    overhead_feed: { name: 'Overhead Camera', icon: '🎥', desc: 'Third-person USB webcam — raw feed' },
+    overhead_detection_feed: { name: 'Overhead Detections', icon: '🔭', desc: 'Third-person webcam with YOLO overlay' },
 };
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
@@ -83,10 +87,20 @@ const defaultLayout: DashboardLayout = {
             id: 'yolo', name: 'YOLO', isSystem: true, modules: [
                 { id: uid(), type: 'vision_v2_controls' },
                 { id: uid(), type: 'ai_detection_feed' },
+                { id: uid(), type: 'overhead_detection_feed' },
                 { id: uid(), type: 'vision_v2_state' },
                 { id: uid(), type: 'rgb_feed' },
                 { id: uid(), type: 'depth_feed' },
                 { id: uid(), type: 'telemetry' },
+            ]
+        },
+        {
+            id: 'autonomy', name: 'Autonomy', isSystem: true, modules: [
+                { id: uid(), type: 'autonomy' },
+                { id: uid(), type: 'overhead_detection_feed' },
+                { id: uid(), type: 'ai_detection_feed' },
+                { id: uid(), type: 'vision_v2_state' },
+                { id: uid(), type: 'rgb_feed' },
             ]
         },
         {
@@ -985,6 +999,390 @@ function AIControlsWidget() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
+// OVERHEAD CAMERA Widget — Third-person view with live status + refresh
+// ═══════════════════════════════════════════════════════════════════════════════
+function OverheadCameraWidget({ mode }: { mode: 'raw' | 'annotated' }) {
+    const [isLive, setIsLive] = useState(false);
+    const [fps, setFps] = useState(0);
+    const [objectCount, setObjectCount] = useState(0);
+    const [inferenceMs, setInferenceMs] = useState(0);
+    const [streamKey, setStreamKey] = useState(Date.now());
+    const [lastUpdate, setLastUpdate] = useState(0);
+    const [cameraName, setCameraName] = useState('');
+
+    // Poll /state every 2s to check connectivity
+    useEffect(() => {
+        let alive = true;
+        const poll = async () => {
+            while (alive) {
+                try {
+                    const res = await fetch(`http://${JETSON_IP}:8081/state`, {
+                        signal: AbortSignal.timeout(2000),
+                    });
+                    const data = await res.json();
+                    if (alive) {
+                        const now = Date.now();
+                        const stale = data.timestamp && (now / 1000 - data.timestamp) > 5;
+                        setIsLive(!stale);
+                        setFps(data.fps || 0);
+                        setObjectCount(data.objects?.length || 0);
+                        setInferenceMs(data.inference_ms || 0);
+                        setCameraName(data.camera_name || '');
+                        setLastUpdate(now);
+                    }
+                } catch {
+                    if (alive) setIsLive(false);
+                }
+                await new Promise(r => setTimeout(r, 2000));
+            }
+        };
+        poll();
+        return () => { alive = false; };
+    }, []);
+
+    const [isRestarting, setIsRestarting] = useState(false);
+
+    const handleRefresh = async () => {
+        if (!isLive) {
+            // Camera is offline — do a full process restart via bridge
+            setIsRestarting(true);
+            try {
+                const res = await fetch(`http://${JETSON_IP}:8888`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ action: 'restart_overhead' }),
+                    signal: AbortSignal.timeout(15000), // restart takes ~5s
+                });
+                const data = await res.json();
+                if (data.success) {
+                    setStreamKey(Date.now());
+                    // Give it a moment then re-poll
+                    await new Promise(r => setTimeout(r, 2000));
+                }
+            } catch { /* ignore */ }
+            setIsRestarting(false);
+        }
+
+        // Always refresh the stream and re-check state
+        setStreamKey(Date.now());
+        try {
+            const res = await fetch(`http://${JETSON_IP}:8081/state`, {
+                signal: AbortSignal.timeout(2000),
+            });
+            const data = await res.json();
+            const now = Date.now();
+            const stale = data.timestamp && (now / 1000 - data.timestamp) > 5;
+            setIsLive(!stale);
+            setFps(data.fps || 0);
+            setObjectCount(data.objects?.length || 0);
+            setInferenceMs(data.inference_ms || 0);
+            setCameraName(data.camera_name || '');
+            setLastUpdate(now);
+        } catch {
+            setIsLive(false);
+        }
+    };
+
+    const streamUrl = `http://${JETSON_IP}:8081/${mode}?t=${streamKey}`;
+    const isAnnotated = mode === 'annotated';
+
+    return (
+        <div className="bg-black rounded-xl overflow-hidden border border-slate-800">
+            {/* Header */}
+            <div className="flex items-center justify-between p-3 bg-slate-900/80">
+                <div className="flex items-center space-x-2">
+                    {/* Pulsing live indicator */}
+                    <div className="relative flex items-center">
+                        <div className={`w-2.5 h-2.5 rounded-full ${isLive ? 'bg-green-500' : 'bg-red-500'}`} />
+                        {isLive && (
+                            <div className="absolute w-2.5 h-2.5 rounded-full bg-green-500 animate-ping opacity-75" />
+                        )}
+                    </div>
+                    <span className="text-sm font-semibold text-slate-300">
+                        {isAnnotated ? '🔭' : '🎥'} Overhead Camera
+                    </span>
+                    {isAnnotated && (
+                        <span className="text-[10px] px-2 py-0.5 bg-green-600/30 text-green-400 rounded-full font-bold">
+                            YOLO
+                        </span>
+                    )}
+                    {cameraName && <span className="text-[10px] text-slate-500">{cameraName}</span>}
+                </div>
+                <div className="flex items-center space-x-3">
+                    {/* Stats */}
+                    {isLive && (
+                        <div className="flex items-center space-x-2 text-[10px] text-slate-400">
+                            <span>{fps.toFixed(0)} FPS</span>
+                            {isAnnotated && <span>{inferenceMs.toFixed(0)}ms</span>}
+                            <span className={`font-bold ${objectCount > 0 ? 'text-cyan-400' : 'text-slate-500'}`}>
+                                {objectCount} obj
+                            </span>
+                        </div>
+                    )}
+                    {/* Refresh button */}
+                    <button
+                        onClick={handleRefresh}
+                        className="p-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-400 hover:text-white transition-all"
+                        title="Reconnect stream"
+                    >
+                        <RefreshCw size={14} />
+                    </button>
+                </div>
+            </div>
+
+            {/* Stream or offline message */}
+            {isLive ? (
+                <img
+                    key={streamKey}
+                    src={streamUrl}
+                    alt={`Overhead ${mode}`}
+                    className="w-full"
+                />
+            ) : (
+                <div className="flex flex-col items-center justify-center py-12 space-y-3">
+                    <Camera size={48} className={`opacity-20 text-slate-500 ${isRestarting ? 'animate-pulse' : ''}`} />
+                    <div className="text-sm text-red-400 font-semibold">
+                        {isRestarting ? 'RESTARTING...' : 'OFFLINE'}
+                    </div>
+                    <div className="text-xs text-slate-500">
+                        {isRestarting ? 'Killing and restarting overhead camera process...' : 'Overhead camera not responding'}
+                    </div>
+                    <button
+                        onClick={handleRefresh}
+                        disabled={isRestarting}
+                        className={`flex items-center space-x-2 px-4 py-1.5 rounded-lg text-xs transition-all ${isRestarting
+                            ? 'bg-yellow-800/30 text-yellow-400 cursor-wait'
+                            : 'bg-slate-800 hover:bg-slate-700 text-slate-300'
+                            }`}
+                    >
+                        <RefreshCw size={12} className={isRestarting ? 'animate-spin' : ''} />
+                        <span>{isRestarting ? 'Restarting Camera...' : 'Restart Camera'}</span>
+                    </button>
+                </div>
+            )}
+        </div>
+    );
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// AUTONOMY Widget — Autonomous sense→think→act loop
+// ═══════════════════════════════════════════════════════════════════════════════
+function AutonomyWidget() {
+    const [goal, setGoal] = useState('');
+    const [running, setRunning] = useState(false);
+    const [step, setStep] = useState(0);
+    const [maxSteps, setMaxSteps] = useState(() => {
+        if (typeof window === 'undefined') return 30;
+        const saved = localStorage.getItem('jetarm-autonomy-maxsteps');
+        return saved ? parseInt(saved, 10) : 30;
+    });
+    const [log, setLog] = useState<{ step: number; phase: string; content: string; time: number }[]>([]);
+    const [loading, setLoading] = useState(false);
+    const [elapsed, setElapsed] = useState(0);
+    const [copied, setCopied] = useState(false);
+    const logRef = useRef<HTMLDivElement>(null);
+
+    // Poll status while running
+    useEffect(() => {
+        if (!running) return;
+        const interval = setInterval(async () => {
+            try {
+                const res = await fetch('/api/autonomy', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ action: 'status' }),
+                });
+                const data = await res.json();
+                if (data.success) {
+                    setRunning(data.running);
+                    setStep(data.step);
+                    setLog(data.log || []);
+                    setElapsed(data.elapsed || 0);
+                }
+            } catch { }
+        }, 1500);
+        return () => clearInterval(interval);
+    }, [running]);
+
+    // Auto-scroll log
+    useEffect(() => {
+        if (logRef.current) {
+            logRef.current.scrollTop = logRef.current.scrollHeight;
+        }
+    }, [log]);
+
+    const startAutonomy = async () => {
+        if (!goal.trim()) return;
+        setLoading(true);
+        try {
+            const res = await fetch('/api/autonomy', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ action: 'start', goal: goal.trim(), maxSteps }),
+            });
+            const data = await res.json();
+            if (data.success) {
+                setRunning(true);
+                setStep(0);
+                setLog([]);
+            }
+        } catch { }
+        setLoading(false);
+    };
+
+    const stopAutonomy = async () => {
+        try {
+            await fetch('/api/autonomy', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ action: 'stop' }),
+            });
+            setRunning(false);
+        } catch { }
+    };
+
+    const phaseColor = (phase: string) => {
+        switch (phase) {
+            case 'SENSE': return 'text-blue-400';
+            case 'THINK': return 'text-purple-400';
+            case 'ACT': return 'text-amber-400';
+            case 'RESULT': return 'text-emerald-400';
+            case 'DONE': return 'text-green-400 font-bold';
+            case 'CANNOT': return 'text-red-400 font-bold';
+            case 'ERROR': return 'text-red-500';
+            case 'WAIT': return 'text-slate-500';
+            case 'START': return 'text-cyan-400 font-bold';
+            case 'LOOK': return 'text-cyan-400';
+            case 'MEMORY': return 'text-purple-400';
+            case 'LEARN': return 'text-teal-400 font-semibold';
+            case 'STOP': case 'END': return 'text-orange-400 font-bold';
+            default: return 'text-slate-400';
+        }
+    };
+
+    const phaseIcon = (phase: string) => {
+        switch (phase) {
+            case 'SENSE': return '👁️';
+            case 'THINK': return '🧠';
+            case 'ACT': return '⚡';
+            case 'RESULT': return '✅';
+            case 'DONE': return '🎉';
+            case 'CANNOT': return '❌';
+            case 'ERROR': return '💥';
+            case 'WAIT': return '⏳';
+            case 'START': return '🚀';
+            case 'LOOK': return '🔍';
+            case 'MEMORY': return '💾';
+            case 'LEARN': return '🧠';
+            case 'STOP': case 'END': return '🛑';
+            default: return '•';
+        }
+    };
+
+    return (
+        <div className="bg-slate-900 border border-slate-800 rounded-2xl p-6 shadow-xl">
+            <div className="flex items-center space-x-3 mb-2">
+                <span className="text-2xl">🤖</span>
+                <h2 className="text-xl font-semibold">Autonomous Mode</h2>
+                <span className={`text-xs px-2.5 py-1 rounded-full font-semibold ${running ? 'bg-green-600/30 text-green-400 animate-pulse' : 'bg-slate-700 text-slate-500'}`}>
+                    {running ? `● Running (Step ${step}/${maxSteps})` : '○ Idle'}
+                </span>
+                {elapsed > 0 && (
+                    <span className="text-xs text-slate-500">{Math.round(elapsed / 1000)}s</span>
+                )}
+            </div>
+            <p className="text-xs text-slate-500 mb-4">Set a goal → robot runs sense→think→act loop autonomously</p>
+
+            {/* Goal input */}
+            <div className="flex gap-2 mb-4">
+                <input
+                    type="text"
+                    value={goal}
+                    onChange={e => setGoal(e.target.value)}
+                    onKeyDown={e => e.key === 'Enter' && !running && startAutonomy()}
+                    placeholder="e.g., Pick up the nearest object"
+                    disabled={running}
+                    className="flex-1 bg-slate-800 border border-slate-700 rounded-lg px-4 py-2.5 text-sm text-white placeholder-slate-500 focus:outline-none focus:border-purple-500 disabled:opacity-50"
+                />
+                {!running ? (
+                    <>
+                        <select
+                            value={maxSteps}
+                            onChange={e => {
+                                const v = parseInt(e.target.value, 10);
+                                setMaxSteps(v);
+                                localStorage.setItem('jetarm-autonomy-maxsteps', String(v));
+                            }}
+                            className="bg-slate-800 border border-slate-700 rounded-lg px-2 py-2.5 text-xs text-slate-300 focus:outline-none focus:border-purple-500 appearance-none cursor-pointer"
+                            title="Max steps"
+                        >
+                            {[5, 10, 15, 20, 25, 30, 50, 75, 100, 150, 200, 300, 500, 999].map(n => (
+                                <option key={n} value={n}>{n} steps</option>
+                            ))}
+                        </select>
+                        <button onClick={startAutonomy} disabled={loading || !goal.trim()}
+                            className="px-5 py-2.5 bg-green-600 hover:bg-green-500 disabled:opacity-50 disabled:cursor-not-allowed transition-colors text-white rounded-lg text-sm font-semibold shadow-lg shadow-green-600/20">
+                            {loading ? '⏳' : '▶'} Start
+                        </button>
+                    </>
+                ) : (
+                    <button onClick={stopAutonomy}
+                        className="px-5 py-2.5 bg-red-600 hover:bg-red-500 transition-colors text-white rounded-lg text-sm font-semibold shadow-lg shadow-red-600/20 animate-pulse">
+                        ⏹ E-STOP
+                    </button>
+                )}
+            </div>
+
+            {/* Preset goals */}
+            {!running && (
+                <div className="flex flex-wrap gap-1.5 mb-4">
+                    {['Look around the workspace', 'Pick up the nearest object', 'Wave hello', 'Nod yes then shake no', 'Touch the closest thing'].map(preset => (
+                        <button key={preset} onClick={() => setGoal(preset)}
+                            className="text-[11px] px-2.5 py-1 bg-slate-800 hover:bg-slate-700 text-slate-400 hover:text-white rounded-md transition-colors border border-slate-700/50">
+                            {preset}
+                        </button>
+                    ))}
+                </div>
+            )}
+
+            {/* Action log */}
+            {log.length > 0 && (
+                <>
+                    {/* Pinned controls — always visible above scroll */}
+                    <div className="flex justify-between items-center mb-2 bg-slate-900 sticky top-0 z-10 py-1">
+                        <span className="text-[10px] text-slate-600 font-semibold uppercase tracking-wide">Action Log ({log.length} entries)</span>
+                        <div className="flex gap-1">
+                            <button
+                                onClick={() => {
+                                    const text = log.map(e => `[Step ${e.step}] ${e.phase}: ${e.content}`).join('\n');
+                                    navigator.clipboard.writeText(text);
+                                    setCopied(true);
+                                    setTimeout(() => setCopied(false), 2000);
+                                }}
+                                className="text-[10px] px-2 py-0.5 bg-slate-800 hover:bg-slate-700 text-slate-400 rounded transition-colors"
+                            >{copied ? '✓ Copied' : 'Copy'}</button>
+                            <button onClick={() => setLog([])} className="text-[10px] px-2 py-0.5 bg-slate-800 hover:bg-slate-700 text-slate-400 rounded transition-colors">Clear</button>
+                        </div>
+                    </div>
+                    <div ref={logRef} className="bg-slate-950 border border-slate-800 rounded-lg p-3 max-h-96 overflow-auto">
+                        <div className="space-y-0.5 text-xs font-mono">
+                            {log.map((entry, i) => (
+                                <div key={i} className={`flex gap-2 ${phaseColor(entry.phase)}`}>
+                                    <span className="opacity-50 w-6 text-right shrink-0">{entry.step}</span>
+                                    <span className="w-4 shrink-0">{phaseIcon(entry.phase)}</span>
+                                    <span className="font-bold w-14 shrink-0">{entry.phase}</span>
+                                    <span className="text-slate-300 break-all">{entry.content}</span>
+                                </div>
+                            ))}
+                        </div>
+                    </div>
+                </>
+            )}
+        </div>
+    );
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
 // VISION V2 — TensorRT Controls Widget
 // ═══════════════════════════════════════════════════════════════════════════════
 function VisionV2ControlsWidget() {
@@ -1228,20 +1626,184 @@ function ModuleContent({ type, shared }: { type: ModuleType; shared: SharedState
                     <div className="bg-slate-950 border border-slate-800 rounded-xl p-4"><GamepadVisualizer gp={shared.gamepad} /></div>
                 </div>
             );
-        case 'telemetry':
+        case 'telemetry': {
+            const SERVO_IDS = [1, 2, 3, 4, 5, 10];
+            const SERVO_NAMES = ['Base (ID:1)', 'Shoulder (ID:2)', 'Elbow (ID:3)', 'Wrist Pitch (ID:4)', 'Wrist Roll (ID:5)', 'Gripper (ID:10)'];
+            const [showConstraints, setShowConstraints] = useState(false);
+            const [constraints, setConstraints] = useState<Record<number, { min: number, max: number }>>(() => {
+                // Load from localStorage on init
+                if (typeof window !== 'undefined') {
+                    try {
+                        const saved = localStorage.getItem('jetarm_servo_constraints');
+                        if (saved) return JSON.parse(saved);
+                    } catch { }
+                }
+                return { 1: { min: 0, max: 1000 }, 2: { min: 450, max: 1000 }, 3: { min: 0, max: 1000 }, 4: { min: 0, max: 1000 }, 5: { min: 0, max: 1000 }, 10: { min: 50, max: 600 } };
+            });
+            const [constraintsSaved, setConstraintsSaved] = useState(true);
+            const [constraintsLoading, setConstraintsLoading] = useState(false);
+
+            // Load constraints from bridge
+            const loadFromBridge = async () => {
+                setConstraintsLoading(true);
+                try {
+                    const res = await fetch(`http://${JETSON_IP}:8888`, {
+                        method: 'POST', headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ action: 'safety_status' }),
+                    });
+                    const data = await res.json();
+                    if (data.success && data.limits) {
+                        const newConstraints: Record<number, { min: number, max: number }> = {};
+                        for (const [k, v] of Object.entries(data.limits) as any) {
+                            newConstraints[parseInt(k)] = { min: v.min, max: v.max };
+                        }
+                        setConstraints(newConstraints);
+                        localStorage.setItem('jetarm_servo_constraints', JSON.stringify(newConstraints));
+                        setConstraintsSaved(true);
+                    }
+                } catch { } finally { setConstraintsLoading(false); }
+            };
+
+            // Save constraints to bridge + localStorage
+            const saveConstraints = async (newConstraints: Record<number, { min: number, max: number }>) => {
+                setConstraints(newConstraints);
+                localStorage.setItem('jetarm_servo_constraints', JSON.stringify(newConstraints));
+                setConstraintsLoading(true);
+                try {
+                    const limitsPayload: Record<string, { min: number, max: number }> = {};
+                    for (const [k, v] of Object.entries(newConstraints)) {
+                        limitsPayload[k] = { min: v.min, max: v.max };
+                    }
+                    const res = await fetch(`http://${JETSON_IP}:8888`, {
+                        method: 'POST', headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ action: 'set_safety_limits', limits: limitsPayload }),
+                    });
+                    const data = await res.json();
+                    if (data.success) setConstraintsSaved(true);
+                } catch { } finally { setConstraintsLoading(false); }
+            };
+
+            const updateConstraint = (servoId: number, field: 'min' | 'max', value: number) => {
+                const clamped = Math.max(0, Math.min(1000, value));
+                const updated = { ...constraints, [servoId]: { ...constraints[servoId], [field]: clamped } };
+                // Ensure min <= max
+                if (field === 'min' && clamped > updated[servoId].max) updated[servoId].max = clamped;
+                if (field === 'max' && clamped < updated[servoId].min) updated[servoId].min = clamped;
+                setConstraintsSaved(false);
+                setConstraints(updated);
+            };
+
             return (
                 <div className="bg-slate-900 border border-slate-800 rounded-2xl p-6 shadow-xl">
                     <div className="flex items-center space-x-3 mb-6"><Activity className="text-blue-400" /><h2 className="text-xl font-semibold">Teleoperation Metrics</h2></div>
                     <div className="space-y-4">
-                        {['Base (ID:1)', 'Shoulder (ID:2)', 'Elbow (ID:3)', 'Wrist Pitch (ID:4)', 'Wrist Roll (ID:5)', 'Gripper (ID:10)'].map((joint, idx) => (
-                            <div key={idx} className="space-y-2">
-                                <div className="flex justify-between text-sm"><span className="text-slate-400">{joint}</span><span className="font-mono text-blue-300">{shared.jointPos[idx]} Pulse</span></div>
-                                <div className="h-2 bg-slate-800 rounded-full overflow-hidden"><div className="h-full bg-blue-500 rounded-full transition-all duration-300 ease-out" style={{ width: `${(shared.jointPos[idx] / 1000) * 100}%` }} /></div>
+                        {SERVO_NAMES.map((joint, idx) => {
+                            const servoId = SERVO_IDS[idx];
+                            const c = constraints[servoId] || { min: 0, max: 1000 };
+                            const pos = shared.jointPos[idx];
+                            const isOutOfBounds = pos < c.min || pos > c.max;
+                            return (
+                                <div key={idx} className="space-y-1.5">
+                                    <div className="flex justify-between text-sm">
+                                        <span className="text-slate-400">{joint}</span>
+                                        <span className={`font-mono ${isOutOfBounds ? 'text-red-400' : 'text-blue-300'}`}>
+                                            {pos} Pulse
+                                            {isOutOfBounds && <span className="text-red-500 text-xs ml-1">⚠️</span>}
+                                        </span>
+                                    </div>
+                                    <div className="h-2 bg-slate-800 rounded-full overflow-hidden relative">
+                                        {/* Constrained range indicator */}
+                                        <div className="absolute h-full bg-slate-700/50 rounded-full" style={{ left: `${(c.min / 1000) * 100}%`, width: `${((c.max - c.min) / 1000) * 100}%` }} />
+                                        {/* Min marker */}
+                                        {c.min > 0 && <div className="absolute h-full w-0.5 bg-red-500/70 z-10" style={{ left: `${(c.min / 1000) * 100}%` }} />}
+                                        {/* Max marker */}
+                                        {c.max < 1000 && <div className="absolute h-full w-0.5 bg-red-500/70 z-10" style={{ left: `${(c.max / 1000) * 100}%` }} />}
+                                        {/* Position bar */}
+                                        <div className={`h-full rounded-full transition-all duration-300 ease-out relative z-20 ${isOutOfBounds ? 'bg-red-500' : 'bg-blue-500'}`} style={{ width: `${(pos / 1000) * 100}%` }} />
+                                    </div>
+                                </div>
+                            );
+                        })}
+                    </div>
+
+                    {/* Servo Constraints Section */}
+                    <div className="mt-6 border-t border-slate-800 pt-4">
+                        <button
+                            onClick={() => { setShowConstraints(!showConstraints); if (!showConstraints) loadFromBridge(); }}
+                            className="flex items-center justify-between w-full text-sm group"
+                        >
+                            <div className="flex items-center space-x-2">
+                                <span className="text-amber-400">🔒</span>
+                                <span className="text-slate-300 font-medium group-hover:text-white transition-colors">Servo Constraints</span>
+                                {!constraintsSaved && <span className="text-xs text-amber-400 bg-amber-900/30 px-1.5 py-0.5 rounded">unsaved</span>}
                             </div>
-                        ))}
+                            <span className={`text-slate-500 transition-transform duration-200 ${showConstraints ? 'rotate-180' : ''}`}>▼</span>
+                        </button>
+
+                        {showConstraints && (
+                            <div className="mt-4 space-y-3 animate-in fade-in duration-200">
+                                <p className="text-xs text-slate-500">Set min/max pulse limits per servo. Changes are enforced on ALL commands (AI, gamepad, chat).</p>
+
+                                {SERVO_NAMES.map((joint, idx) => {
+                                    const servoId = SERVO_IDS[idx];
+                                    const c = constraints[servoId] || { min: 0, max: 1000 };
+                                    const defaults: Record<number, { min: number, max: number }> = { 1: { min: 0, max: 1000 }, 2: { min: 450, max: 1000 }, 3: { min: 0, max: 1000 }, 4: { min: 0, max: 1000 }, 5: { min: 0, max: 1000 }, 10: { min: 50, max: 600 } };
+                                    const d = defaults[servoId] || { min: 0, max: 1000 };
+                                    const isModified = c.min !== d.min || c.max !== d.max;
+                                    return (
+                                        <div key={servoId} className={`flex items-center gap-2 text-sm p-2 rounded-lg ${isModified ? 'bg-amber-900/10 border border-amber-800/30' : 'bg-slate-800/30'}`}>
+                                            <span className="text-slate-400 w-28 shrink-0 text-xs">{joint.split('(')[0].trim()}</span>
+                                            <div className="flex items-center gap-1.5 flex-1">
+                                                <span className="text-slate-500 text-xs">Min</span>
+                                                <input
+                                                    type="number" min={0} max={1000} value={c.min}
+                                                    onChange={(e) => updateConstraint(servoId, 'min', parseInt(e.target.value) || 0)}
+                                                    className="w-16 bg-slate-800 border border-slate-700 rounded px-2 py-1 text-xs font-mono text-slate-300 focus:border-amber-500 focus:outline-none"
+                                                />
+                                                <div className="flex-1 h-1 bg-slate-800 rounded-full mx-1 relative">
+                                                    <div className="absolute h-full bg-emerald-600/50 rounded-full" style={{ left: `${(c.min / 1000) * 100}%`, width: `${((c.max - c.min) / 1000) * 100}%` }} />
+                                                </div>
+                                                <span className="text-slate-500 text-xs">Max</span>
+                                                <input
+                                                    type="number" min={0} max={1000} value={c.max}
+                                                    onChange={(e) => updateConstraint(servoId, 'max', parseInt(e.target.value) || 0)}
+                                                    className="w-16 bg-slate-800 border border-slate-700 rounded px-2 py-1 text-xs font-mono text-slate-300 focus:border-amber-500 focus:outline-none"
+                                                />
+                                            </div>
+                                        </div>
+                                    );
+                                })}
+
+                                <div className="flex items-center justify-between pt-2">
+                                    <button
+                                        onClick={() => {
+                                            const defaults: Record<number, { min: number, max: number }> = { 1: { min: 0, max: 1000 }, 2: { min: 450, max: 1000 }, 3: { min: 0, max: 1000 }, 4: { min: 0, max: 1000 }, 5: { min: 0, max: 1000 }, 10: { min: 50, max: 600 } };
+                                            setConstraints(defaults);
+                                            setConstraintsSaved(false);
+                                        }}
+                                        className="text-xs text-slate-500 hover:text-slate-300 transition-colors"
+                                    >
+                                        Reset to defaults
+                                    </button>
+                                    <button
+                                        onClick={() => saveConstraints(constraints)}
+                                        disabled={constraintsSaved || constraintsLoading}
+                                        className={`px-4 py-1.5 rounded-lg text-xs font-semibold transition-all ${constraintsSaved
+                                            ? 'bg-emerald-900/30 text-emerald-400 border border-emerald-800/30'
+                                            : constraintsLoading
+                                                ? 'bg-slate-700 text-slate-400 animate-pulse'
+                                                : 'bg-amber-600 hover:bg-amber-500 text-white shadow-lg shadow-amber-900/30'
+                                            }`}
+                                    >
+                                        {constraintsSaved ? '✓ Saved' : constraintsLoading ? 'Saving...' : 'Save to Robot'}
+                                    </button>
+                                </div>
+                            </div>
+                        )}
                     </div>
                 </div>
             );
+        }
         case 'control_scheme': {
             const scheme = [
                 { action: 'Base Rotate', control: 'L Stick X', color: 'text-blue-400' },
@@ -1374,6 +1936,12 @@ function ModuleContent({ type, shared }: { type: ModuleType; shared: SharedState
             return <VisionV2ControlsWidget />;
         case 'vision_v2_state':
             return <VisionV2StateWidget />;
+        case 'autonomy':
+            return <AutonomyWidget />;
+        case 'overhead_feed':
+            return <OverheadCameraWidget mode="raw" />;
+        case 'overhead_detection_feed':
+            return <OverheadCameraWidget mode="annotated" />;
     }
 }
 
@@ -1626,6 +2194,7 @@ export default function Dashboard() {
     const [yoloFps, setYoloFps] = useState(0);
     const [yoloCount, setYoloCount] = useState(0);
     const lastDebugRef = useRef<string>('');
+    const estopLastRef = useRef<number>(0);
 
     const shared: SharedState = {
         rosConnected, controllerActive, jointPos, gamepad,
@@ -1699,6 +2268,16 @@ export default function Dashboard() {
                 const debugStr = [...pressedNames, ...activeAxes].join(',');
                 if (debugStr && debugStr !== lastDebugRef.current) logToServer({ type: 'raw', buttons: pressedNames, axes: activeAxes });
                 lastDebugRef.current = debugStr || '';
+
+                // 🛑 KILL SWITCH: SELECT button (index 8) triggers emergency stop
+                if (buttons[8] === 1 && Date.now() - estopLastRef.current > 1000) {
+                    estopLastRef.current = Date.now();
+                    fetch(`http://${JETSON_IP}:8888`, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ action: 'emergency_stop' }),
+                    }).catch(() => { });
+                }
             });
 
             // Subscribe to YOLO detections

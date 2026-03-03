@@ -8,7 +8,15 @@ import json
 import time
 import math
 import threading
+import urllib.request
+import sys
+import os
 from http.server import HTTPServer, BaseHTTPRequestHandler
+
+# Add project root to path for spatial_calibration import
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from spatial_calibration import pixel_depth_to_arm_xyz, load_calibration
+from action_memory import get_memory
 
 import rclpy
 from rclpy.node import Node
@@ -24,6 +32,160 @@ from kinematics.kinematics_control import set_pose_target
 
 # Global reference to the ROS node
 node = None
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# SAFETY LAYER — Hardware-level joint limits enforced on EVERY move command
+# ═══════════════════════════════════════════════════════════════════════════════
+SAFETY_LIMITS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'safety_limits.json')
+
+# Default safety limits per servo — [min_position, max_position]
+# These are enforced BEFORE any command reaches the hardware
+DEFAULT_SAFETY_LIMITS = {
+    1:  {'min': 0,   'max': 1000, 'name': 'Base rotation'},
+    2:  {'min': 450, 'max': 1000, 'name': 'Shoulder (⚠️ broken gear: min 450)'},
+    3:  {'min': 0,   'max': 1000, 'name': 'Elbow'},
+    4:  {'min': 0,   'max': 1000, 'name': 'Wrist pitch'},
+    5:  {'min': 0,   'max': 1000, 'name': 'Wrist rotate'},
+    10: {'min': 50,  'max': 600,  'name': 'Gripper'},
+}
+
+# Max movement speed — limits duration to prevent jerky moves
+MIN_DURATION_MS = 200    # Minimum movement duration
+MAX_MOVE_PER_STEP = 500  # Max pulse change per command (safety)
+
+# Safety event log
+safety_log = []
+MAX_SAFETY_LOG = 100
+
+def load_safety_limits():
+    """Load safety limits from file, fallback to defaults."""
+    if os.path.exists(SAFETY_LIMITS_FILE):
+        try:
+            with open(SAFETY_LIMITS_FILE) as f:
+                saved = json.load(f)
+                limits = dict(DEFAULT_SAFETY_LIMITS)
+                for k, v in saved.items():
+                    sid = int(k)
+                    if sid in limits:
+                        limits[sid].update(v)
+                return limits
+        except:
+            pass
+    return dict(DEFAULT_SAFETY_LIMITS)
+
+def save_safety_limits(limits):
+    """Save safety limits to file."""
+    serializable = {str(k): v for k, v in limits.items()}
+    with open(SAFETY_LIMITS_FILE, 'w') as f:
+        json.dump(serializable, f, indent=2)
+
+def log_safety_event(event_type, message, servo_id=None, requested=None, clamped=None):
+    """Log a safety event."""
+    global safety_log
+    entry = {
+        'time': time.time(),
+        'type': event_type,
+        'message': message,
+        'servo_id': servo_id,
+    }
+    if requested is not None:
+        entry['requested'] = requested
+    if clamped is not None:
+        entry['clamped'] = clamped
+    safety_log.append(entry)
+    if len(safety_log) > MAX_SAFETY_LOG:
+        safety_log = safety_log[-MAX_SAFETY_LOG:]
+    print(f'  ⚠️ SAFETY: {message}')
+
+def enforce_safety(positions, duration_ms):
+    """Enforce safety limits on servo positions. Returns (safe_positions, safe_duration, warnings)."""
+    limits = load_safety_limits()
+    safe_positions = []
+    warnings = []
+    
+    # Enforce minimum duration
+    safe_duration = max(MIN_DURATION_MS, duration_ms)
+    
+    for p in positions:
+        sid = int(p['id'])
+        requested_pos = int(p['position'])
+        
+        if sid in limits:
+            lim = limits[sid]
+            clamped_pos = max(lim['min'], min(lim['max'], requested_pos))
+            
+            if clamped_pos != requested_pos:
+                msg = f"Servo {sid} ({lim['name']}): {requested_pos} clamped to {clamped_pos} (limits: {lim['min']}-{lim['max']})"
+                warnings.append(msg)
+                log_safety_event('CLAMP', msg, servo_id=sid, requested=requested_pos, clamped=clamped_pos)
+            
+            safe_positions.append({'id': sid, 'position': clamped_pos})
+        else:
+            # Unknown servo — allow but warn
+            clamped_pos = max(0, min(1000, requested_pos))
+            safe_positions.append({'id': sid, 'position': clamped_pos})
+    
+    return safe_positions, safe_duration, warnings
+
+# World state — unified view of robot + environment
+world_state = {
+    'servos': {},
+    'gripper': 'unknown',
+    'objects': [],
+    'vision_fps': 0,
+    'overhead_objects': [],
+    'overhead_fps': 0,
+    'last_action': None,
+    'last_action_result': None,
+    'last_action_time': 0,
+    'timestamp': 0,
+}
+
+def update_world_state():
+    """Update world state from all sources."""
+    global world_state
+    # Servo positions
+    if node and node.servo_states:
+        world_state['servos'] = {str(k): v['position'] for k, v in node.servo_states.items()}
+        # Estimate gripper state from servo 10
+        grip = node.servo_states.get(10, {}).get('position', 500)
+        if grip < 200:
+            world_state['gripper'] = 'closed'
+        elif grip > 400:
+            world_state['gripper'] = 'open'
+        else:
+            world_state['gripper'] = 'partial'
+    
+    # Arm camera YOLO (port 8889)
+    try:
+        req = urllib.request.Request('http://localhost:8889/state')
+        with urllib.request.urlopen(req, timeout=0.5) as resp:
+            vision = json.loads(resp.read())
+            objects = vision.get('objects', [])
+            # Enrich objects with arm XYZ from spatial calibration
+            cal = load_calibration()
+            for obj in objects:
+                depth = obj.get('depth_mm', 0)
+                if depth > 0:
+                    px, py = obj['center_px']
+                    spatial = pixel_depth_to_arm_xyz(px, py, depth, cal)
+                    obj['arm_xyz'] = spatial
+            world_state['objects'] = objects
+            world_state['vision_fps'] = vision.get('fps', 0)
+    except:
+        pass  # YOLO not running
+    
+    # Overhead camera YOLO (port 8081)
+    try:
+        req = urllib.request.Request('http://localhost:8081/state')
+        with urllib.request.urlopen(req, timeout=0.5) as resp:
+            overhead = json.loads(resp.read())
+            world_state['overhead_objects'] = overhead.get('objects', [])
+            world_state['overhead_fps'] = overhead.get('fps', 0)
+    except:
+        pass  # Overhead camera not running
+    
+    world_state['timestamp'] = time.time()
 
 class JetArmBridge(Node):
     def __init__(self):
@@ -65,19 +227,19 @@ class JetArmBridge(Node):
             }
 
     def move_servos(self, positions, duration_ms=500):
-        """Move servos via bus (direct hardware control).
-        duration_ms: duration in milliseconds from dashboard.
-        ROS SDK expects SECONDS (it internally multiplies by 1000).
-        """
+        """Move servos via bus with SAFETY LIMITS enforced."""
+        # ⚠️ SAFETY: Enforce limits before ANY command reaches hardware
+        safe_positions, safe_duration, warnings = enforce_safety(positions, duration_ms)
+        
         msg = BusServosPosition()
-        msg.duration = float(duration_ms / 1000.0)  # Convert ms → seconds
-        for p in positions:
+        msg.duration = float(safe_duration / 1000.0)  # Convert ms → seconds
+        for p in safe_positions:
             sp = BusServoPosition()
             sp.id = int(p['id'])
-            sp.position = int(max(0, min(1000, p['position'])))
+            sp.position = int(p['position'])
             msg.position.append(sp)
         self.bus_servo_pub.publish(msg)
-        return True
+        return True, warnings
 
     def move_to_xyz(self, x, y, z, pitch=-90, duration=1500):
         """Move using inverse kinematics."""
@@ -122,8 +284,14 @@ class BridgeHandler(BaseHTTPRequestHandler):
             if action == 'move_arm':
                 positions = body.get('positions', [])
                 duration = body.get('duration', 500)
-                node.move_servos(positions, duration)
-                result = {'success': True, 'message': f'Moved {len(positions)} servos ({duration}ms)'}
+                _, warnings = node.move_servos(positions, duration)
+                msg = f'Moved {len(positions)} servos ({duration}ms)'
+                if warnings:
+                    msg += ' | Safety: ' + '; '.join(warnings)
+                result = {'success': True, 'message': msg, 'warnings': warnings}
+                world_state['last_action'] = f'move_arm({len(positions)} servos, {duration}ms)'
+                world_state['last_action_result'] = 'success'
+                world_state['last_action_time'] = time.time()
 
             elif action == 'move_servo':
                 sid = body.get('servo_id', 1)
@@ -141,14 +309,41 @@ class BridgeHandler(BaseHTTPRequestHandler):
                 pulses = node.move_to_xyz(x, y, z, pitch, dur)
                 if pulses:
                     result = {'success': True, 'message': f'Moved to ({x},{y},{z})', 'pulses': pulses}
+                    world_state['last_action'] = f'move_to_xyz({x},{y},{z})'
+                    world_state['last_action_result'] = 'success'
                 else:
                     result = {'success': False, 'message': 'IK solution not found'}
+                    world_state['last_action'] = f'move_to_xyz({x},{y},{z})'
+                    world_state['last_action_result'] = 'FAILED: IK not found'
+                world_state['last_action_time'] = time.time()
 
             elif action == 'home':
                 dur = body.get('duration', 500)
                 positions = [{'id': i, 'position': 500} for i in [1,2,3,4,5,10]]
                 node.move_servos(positions, dur)
                 result = {'success': True, 'message': f'Home ({dur}ms)'}
+
+            elif action == 'emergency_stop':
+                # EMERGENCY STOP: Read current positions and hold them with 0ms duration
+                # This instantly freezes all servos in their current position
+                current = node.get_servo_states()
+                positions = []
+                for sid in [1, 2, 3, 4, 5, 10]:
+                    if sid in current:
+                        positions.append({'id': sid, 'position': current[sid]['position']})
+                    else:
+                        positions.append({'id': sid, 'position': 500})
+                msg = BusServosPosition()
+                msg.duration = 0.0  # Instant — no interpolation
+                for p in positions:
+                    sp = BusServoPosition()
+                    sp.id = int(p['id'])
+                    sp.position = int(p['position'])
+                    msg.position.append(sp)
+                node.bus_servo_pub.publish(msg)
+                node.buzzer(2000, 0.1, 0.05, 2)  # Short beep to confirm
+                log_safety_event('ESTOP', 'Emergency stop triggered — all servos frozen')
+                result = {'success': True, 'message': '🛑 Emergency stop — all servos frozen'}
 
             elif action == 'read_servos':
                 result = {'success': True, 'servos': node.get_servo_states()}
@@ -162,8 +357,181 @@ class BridgeHandler(BaseHTTPRequestHandler):
                 )
                 result = {'success': True, 'message': 'Buzzer played'}
 
+            elif action == 'world_state':
+                update_world_state()
+                result = {'success': True, 'state': world_state}
+
+            elif action == 'move_to_object':
+                # Find object by class name, compute arm XYZ, move there
+                target_class = body.get('class', '').lower()
+                approach_height = body.get('approach_height', 0.03)  # 3cm above
+                pitch = body.get('pitch', -90)
+                dur = body.get('duration', 1500)
+                gripper_action = body.get('gripper', None)  # 'open', 'close', or None
+                
+                # Get latest detections
+                update_world_state()
+                found = None
+                for obj in world_state.get('objects', []):
+                    if obj['class'].lower() == target_class and obj.get('arm_xyz'):
+                        if obj['arm_xyz'].get('reachable'):
+                            found = obj
+                            break
+                        elif found is None:
+                            found = obj  # Keep unreachable as fallback
+                
+                if not found:
+                    result = {'success': False, 'error': f'Object "{target_class}" not found in view'}
+                elif not found.get('arm_xyz'):
+                    result = {'success': False, 'error': f'No depth data for "{target_class}"'}
+                else:
+                    xyz = found['arm_xyz']
+                    x, y, z = xyz['x'], xyz['y'], xyz['z'] + approach_height
+                    
+                    # Open gripper first if requested
+                    if gripper_action == 'open':
+                        node.move_servos([{'id': 10, 'position': 500}], 400)
+                        time.sleep(0.5)
+                    
+                    # Move to object position
+                    pulses = node.move_to_xyz(x, y, z, pitch, dur)
+                    if pulses:
+                        result = {
+                            'success': True,
+                            'message': f'Moved to {target_class} at ({x:.3f}, {y:.3f}, {z:.3f})',
+                            'object': found['class'],
+                            'arm_xyz': xyz,
+                            'pulses': pulses,
+                        }
+                        world_state['last_action'] = f'move_to_object({target_class})'
+                        world_state['last_action_result'] = 'success'
+                        
+                        # Close gripper after if requested
+                        if gripper_action == 'close':
+                            time.sleep(dur / 1000.0 + 0.3)
+                            node.move_servos([{'id': 10, 'position': 150}], 500)
+                    else:
+                        result = {
+                            'success': False,
+                            'error': f'IK failed for {target_class} at ({x:.3f}, {y:.3f}, {z:.3f})',
+                            'arm_xyz': xyz,
+                        }
+                        world_state['last_action'] = f'move_to_object({target_class})'
+                        world_state['last_action_result'] = 'FAILED: IK not found'
+                    world_state['last_action_time'] = time.time()
+
             elif action == 'ping':
                 result = {'success': True, 'message': 'pong', 'timestamp': time.time()}
+
+            elif action == 'safety_status':
+                limits = load_safety_limits()
+                result = {
+                    'success': True,
+                    'limits': {str(k): v for k, v in limits.items()},
+                    'log': safety_log[-20:],
+                    'total_events': len(safety_log),
+                }
+
+            elif action == 'set_safety_limits':
+                limits = load_safety_limits()
+                updates = body.get('limits', {})
+                for k, v in updates.items():
+                    sid = int(k)
+                    if sid in limits:
+                        if 'min' in v:
+                            limits[sid]['min'] = int(v['min'])
+                        if 'max' in v:
+                            limits[sid]['max'] = int(v['max'])
+                save_safety_limits(limits)
+                log_safety_event('CONFIG', f'Safety limits updated: {json.dumps(updates)}')
+                result = {'success': True, 'message': 'Safety limits updated', 'limits': {str(k): v for k, v in limits.items()}}
+
+            elif action == 'memory_log':
+                memory = get_memory()
+                memory.log_action(
+                    goal=body.get('goal', ''),
+                    step=body.get('step', 0),
+                    action_type=body.get('action_type', 'unknown'),
+                    action_json=body.get('action_json', {}),
+                    result=body.get('result', ''),
+                    success=body.get('success', False),
+                    scene_objects=body.get('scene_objects'),
+                    servo_positions=body.get('servo_positions'),
+                    gripper_state=body.get('gripper_state'),
+                    notes=body.get('notes'),
+                    session_id=body.get('session_id'),
+                )
+                result = {'success': True, 'message': 'Action logged to memory'}
+
+            elif action == 'memory_context':
+                memory = get_memory()
+                goal = body.get('goal', '')
+                context = memory.get_context_for_goal(goal)
+                result = {'success': True, 'context': context}
+
+            elif action == 'memory_stats':
+                memory = get_memory()
+                stats = memory.get_stats()
+                result = {'success': True, 'stats': stats}
+
+            elif action == 'memory_session_start':
+                memory = get_memory()
+                session_id = memory.start_session(body.get('goal', ''))
+                result = {'success': True, 'session_id': session_id}
+
+            elif action == 'memory_session_end':
+                memory = get_memory()
+                memory.end_session(
+                    body.get('session_id', ''),
+                    body.get('total_steps', 0),
+                    body.get('success', False),
+                    body.get('final_result', '')
+                )
+                result = {'success': True, 'message': 'Session ended'}
+
+            elif action == 'memory_lesson':
+                memory = get_memory()
+                memory.add_lesson(
+                    category=body.get('category', 'general'),
+                    lesson=body.get('lesson', ''),
+                    confidence=body.get('confidence', 0.5),
+                    source_session=body.get('session_id'),
+                )
+                result = {'success': True, 'message': 'Lesson recorded'}
+
+            elif action == 'memory_lessons':
+                memory = get_memory()
+                lessons = memory.get_lessons(
+                    category=body.get('category'),
+                    limit=body.get('limit', 10),
+                )
+                result = {'success': True, 'lessons': lessons}
+
+            elif action == 'restart_overhead':
+                import subprocess
+                # Kill existing overhead_camera.py process
+                subprocess.run(['pkill', '-f', 'overhead_camera.py'], capture_output=True)
+                time.sleep(2)
+                # Restart it in background
+                subprocess.Popen(
+                    ['python3', '/home/danny/overhead_camera.py'],
+                    stdout=open('/tmp/overhead.log', 'w'),
+                    stderr=subprocess.STDOUT,
+                    start_new_session=True,
+                )
+                time.sleep(3)
+                # Verify it's back online
+                try:
+                    import urllib.request as urlreq
+                    check = json.loads(urlreq.urlopen('http://localhost:8081/state', timeout=3).read())
+                    result = {
+                        'success': True,
+                        'message': f"Overhead camera restarted — {check.get('fps', 0):.0f} FPS",
+                        'fps': check.get('fps', 0),
+                        'camera_name': check.get('camera_name', ''),
+                    }
+                except:
+                    result = {'success': True, 'message': 'Overhead camera restart initiated (warming up...)'}
 
         except Exception as e:
             result = {'success': False, 'error': str(e)}
