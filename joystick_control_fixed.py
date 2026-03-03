@@ -20,7 +20,7 @@ from servo_controller import bus_servo_control, actions
 from kinematics.kinematics_control import set_pose_target
 from kinematics_msgs.srv import SetRobotPose, GetRobotPose
 from servo_controller_msgs.msg import ServosPosition, ServoPosition, ServoStateList
-from ros_robot_controller_msgs.msg import BuzzerState, GetBusServoCmd, MotorsState, MotorState
+from ros_robot_controller_msgs.msg import BuzzerState, GetBusServoCmd, MotorsState, MotorState, SetBusServoState, BusServoState
 
 os.environ["SDL_VIDEODRIVER"] = "dummy"
 pg.display.init()
@@ -86,6 +86,7 @@ class JoystickController(Node):
         self.current_servo_position = np.array([500]*6) # 1,2,3,4,5,10
         self.servos_pub = self.create_publisher(ServosPosition, '/servo_controller', 1)
         self.joy_pub = self.create_publisher(Joy, '/joy', 5)
+        self.servo_state_pub = self.create_publisher(SetBusServoState, '/ros_robot_controller/bus_servo/set_state', 1)
         self.estop_active = False  # 🛑 Emergency stop flag
         
         try:
@@ -164,16 +165,21 @@ class JoystickController(Node):
             bus_servo_control.set_servo_position(self.servos_pub, 0.05, ((10, new_pos),))
 
     def select_callback(self, state):
-        """🛑 EMERGENCY STOP — SELECT button freezes all servos"""
+        """🛑 EMERGENCY STOP — SELECT kills torque on all servos (they drop)"""
         if state == ButtonState.Pressed:
             self.estop_active = True
-            # Hold current positions immediately
-            pos = self.current_servo_position
+            # Kill torque — servos go limp immediately
             servo_ids = [1, 2, 3, 4, 5, 10]
-            positions = tuple((sid, int(pos[i])) for i, sid in enumerate(servo_ids))
-            bus_servo_control.set_servo_position(self.servos_pub, 0.0, positions)
+            for sid in servo_ids:
+                msg = SetBusServoState()
+                servo = BusServoState()
+                servo.target_id = [sid]
+                servo.enable_torque = [0]  # 0 = torque off (limp)
+                msg.state = [servo]
+                msg.duration = 0.0
+                self.servo_state_pub.publish(msg)
             self.buzzer_pub.set_buzzer(1000, 0.1, 0.0, 1)  # Single soft beep
-            self.get_logger().warn('🛑 EMERGENCY STOP — all servos frozen. Press START to resume.')
+            self.get_logger().warn('🛑 EMERGENCY STOP — all servo torque killed. Press START to resume.')
 
     def start_callback(self, state):
         if state == ButtonState.Pressed:
