@@ -2,6 +2,7 @@
 # encoding: utf-8
 import os
 import json
+import urllib.request
 import math
 import time
 import rclpy
@@ -56,11 +57,11 @@ BUTTON_MAP = [
 # ─── SAFETY LIMITS — Enforced on ALL gamepad servo commands ───────────────────
 SERVO_LIMITS = {
     1:  (0,   1000),  # Base rotation
-    2:  (450, 1000),  # Shoulder (⚠️ broken gear: min 450)
+    2:  (0,   1000),  # Shoulder
     3:  (0,   1000),  # Elbow
     4:  (0,   1000),  # Wrist pitch
     5:  (0,   1000),  # Wrist rotate
-    10: (50,  600),   # Gripper
+    10: (0,   1000),  # Gripper
 }
 
 def clamp_servo(servo_id, value):
@@ -81,7 +82,7 @@ class JoystickController(Node):
         self.count = 0
         self.joy = None
         self.mode = 0  # 0: Manual, 1: Coordinate
-        self.min_value = 0.15  # Deadzone threshold
+        self.min_value = 0.30  # Deadzone threshold (increased for ZD-V+ stick drift)
         
         # Auto-calibration: sample neutral stick positions on first connect
         self.calibrated = False
@@ -180,38 +181,29 @@ class JoystickController(Node):
             bus_servo_control.set_servo_position(self.servos_pub, 0.05, ((10, new_pos),))
 
     def select_callback(self, state):
-        """🛑 EMERGENCY STOP — SELECT kills torque on all servos (they drop)"""
+        """🛑 EMERGENCY STOP — SELECT kills torque via bridge API (most reliable path)"""
         if state == ButtonState.Pressed:
             self.estop_active = True
-            # Check if ros_robot_controller is reachable
-            if self.servo_state_pub.get_subscription_count() == 0:
-                self.get_logger().error('🛑 ESTOP: ros_robot_controller NOT running — torque kill unavailable!')
-                return
-            # Kill torque — servos go limp immediately
-            servo_ids = [1, 2, 3, 4, 5, 10]
-            for sid in servo_ids:
-                msg = SetBusServoState()
-                servo = BusServoState()
-                servo.present_id = [1, sid]       # [flag=1, servo_id]
-                servo.enable_torque = [1, 0]      # [flag=1, value=0 (torque OFF)]
-                msg.state = [servo]
-                msg.duration = 0.0
-                self.servo_state_pub.publish(msg)
+            try:
+                req = urllib.request.Request('http://localhost:8888',
+                    data=b'{"action":"emergency_stop"}',
+                    headers={'Content-Type': 'application/json'})
+                urllib.request.urlopen(req, timeout=2)
+            except Exception as e:
+                self.get_logger().error(f'🛑 ESTOP HTTP failed: {e}')
             self.get_logger().warn('🛑 EMERGENCY STOP — all servo torque killed. Press START to resume.')
 
     def start_callback(self, state):
         if state == ButtonState.Pressed:
             if self.estop_active:
-                # Resume from emergency stop — re-enable torque on all servos
-                servo_ids = [1, 2, 3, 4, 5, 10]
-                for sid in servo_ids:
-                    msg = SetBusServoState()
-                    servo = BusServoState()
-                    servo.present_id = [1, sid]
-                    servo.enable_torque = [1, 1]  # [flag=1, value=1 (torque ON)]
-                    msg.state = [servo]
-                    msg.duration = 0.0
-                    self.servo_state_pub.publish(msg)
+                # Resume from emergency stop via bridge API
+                try:
+                    req = urllib.request.Request('http://localhost:8888',
+                        data=b'{"action":"resume"}',
+                        headers={'Content-Type': 'application/json'})
+                    urllib.request.urlopen(req, timeout=2)
+                except Exception as e:
+                    self.get_logger().error(f'Resume HTTP failed: {e}')
                 self.estop_active = False
                 self.get_logger().info('✅ Emergency stop cleared — torque re-enabled, gamepad active')
                 return
@@ -265,10 +257,13 @@ class JoystickController(Node):
             # Don't process input during calibration
             return
 
-        # Apply calibration offsets and clamp to [-1, 1]
+        # Apply calibration offsets, dead zone zeroing, and clamp to [-1, 1]
         cal_axes = []
         for i in range(min(4, len(raw_axes))):
             corrected = raw_axes[i] - self.axis_offsets[i]
+            # Zero out values within dead zone to prevent drift accumulation
+            if abs(corrected) < self.min_value:
+                corrected = 0.0
             corrected = max(-1.0, min(1.0, corrected))
             cal_axes.append(corrected)
         # Keep remaining axes (if any) untouched
@@ -291,7 +286,7 @@ class JoystickController(Node):
         try:
             # Match original HiWonder AXES_MAP: axis0=LY, axis1=LX, axis2=RY, axis3=RX
             # All axes negated (original does -self.joy.get_axis(i) for all)
-            axes = {'ly': -cal_axes[0], 'lx': -cal_axes[1], 'ry': -cal_axes[2], 'rx': -cal_axes[3]}
+            axes = {'lx': -cal_axes[0], 'ly': -cal_axes[1], 'rx': -cal_axes[2], 'ry': -cal_axes[3]}
             self.axes_callback(axes)
         except:
             pass

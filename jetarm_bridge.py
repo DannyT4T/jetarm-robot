@@ -335,7 +335,7 @@ class BridgeHandler(BaseHTTPRequestHandler):
                     msg = SetBusServoState()
                     servo = BusServoState()
                     servo.present_id = [1, sid]       # [flag=1, servo_id]
-                    servo.enable_torque = [1, 0]      # [flag=1, value=0 (torque OFF)]
+                    servo.enable_torque = [1, 1]      # [flag=1, value=1 (torque OFF — firmware is inverted)]
                     msg.state = [servo]
                     msg.duration = 0.0
                     node.servo_state_pub.publish(msg)
@@ -349,7 +349,7 @@ class BridgeHandler(BaseHTTPRequestHandler):
                     msg = SetBusServoState()
                     servo = BusServoState()
                     servo.present_id = [1, sid]
-                    servo.enable_torque = [1, 1]      # [flag=1, value=1 (torque ON)]
+                    servo.enable_torque = [1, 0]      # [flag=1, value=0 (torque ON — firmware is inverted)]
                     msg.state = [servo]
                     msg.duration = 0.0
                     node.servo_state_pub.publish(msg)
