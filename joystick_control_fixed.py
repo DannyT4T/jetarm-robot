@@ -81,13 +81,28 @@ class JoystickController(Node):
         self.count = 0
         self.joy = None
         self.mode = 0  # 0: Manual, 1: Coordinate
-        self.min_value = 0.1
+        self.min_value = 0.15  # Deadzone threshold
+        
+        # Auto-calibration: sample neutral stick positions on first connect
+        self.calibrated = False
+        self.calibration_samples = []  # collect raw axis readings
+        self.axis_offsets = [0.0, 0.0, 0.0, 0.0]  # neutral offsets for axes 0-3
         self.buzzer_pub = buzzer.BuzzerController()
         self.current_servo_position = np.array([500]*6) # 1,2,3,4,5,10
         self.servos_pub = self.create_publisher(ServosPosition, '/servo_controller', 1)
         self.joy_pub = self.create_publisher(Joy, '/joy', 5)
-        self.servo_state_pub = self.create_publisher(SetBusServoState, '/ros_robot_controller/bus_servo/set_state', 1)
+        self.servo_state_pub = self.create_publisher(SetBusServoState, '/ros_robot_controller/bus_servo/set_state', 10)
         self.estop_active = False  # 🛑 Emergency stop flag
+        
+        # Wait for ros_robot_controller to be discovered (needed for kill switch)
+        self.get_logger().info('Waiting for ros_robot_controller DDS discovery...')
+        for i in range(20):  # up to 10 seconds
+            if self.servo_state_pub.get_subscription_count() > 0:
+                self.get_logger().info('✅ ros_robot_controller connected (kill switch ready)')
+                break
+            time.sleep(0.5)
+        else:
+            self.get_logger().warn('⚠️ ros_robot_controller not found — kill switch will not work until it connects')
         
         try:
             self.chassis_type = os.environ['CHASSIS_TYPE']
@@ -168,26 +183,37 @@ class JoystickController(Node):
         """🛑 EMERGENCY STOP — SELECT kills torque on all servos (they drop)"""
         if state == ButtonState.Pressed:
             self.estop_active = True
+            # Check if ros_robot_controller is reachable
+            if self.servo_state_pub.get_subscription_count() == 0:
+                self.get_logger().error('🛑 ESTOP: ros_robot_controller NOT running — torque kill unavailable!')
+                return
             # Kill torque — servos go limp immediately
             servo_ids = [1, 2, 3, 4, 5, 10]
             for sid in servo_ids:
                 msg = SetBusServoState()
                 servo = BusServoState()
-                servo.target_id = [sid]
-                servo.enable_torque = [0]  # 0 = torque off (limp)
+                servo.present_id = [1, sid]       # [flag=1, servo_id]
+                servo.enable_torque = [1, 0]      # [flag=1, value=0 (torque OFF)]
                 msg.state = [servo]
                 msg.duration = 0.0
                 self.servo_state_pub.publish(msg)
-            self.buzzer_pub.set_buzzer(1000, 0.1, 0.0, 1)  # Single soft beep
             self.get_logger().warn('🛑 EMERGENCY STOP — all servo torque killed. Press START to resume.')
 
     def start_callback(self, state):
         if state == ButtonState.Pressed:
             if self.estop_active:
-                # Resume from emergency stop
+                # Resume from emergency stop — re-enable torque on all servos
+                servo_ids = [1, 2, 3, 4, 5, 10]
+                for sid in servo_ids:
+                    msg = SetBusServoState()
+                    servo = BusServoState()
+                    servo.present_id = [1, sid]
+                    servo.enable_torque = [1, 1]  # [flag=1, value=1 (torque ON)]
+                    msg.state = [servo]
+                    msg.duration = 0.0
+                    self.servo_state_pub.publish(msg)
                 self.estop_active = False
-                self.buzzer_pub.set_buzzer(1000, 0.1, 0.1, 2)  # Double beep
-                self.get_logger().info('✅ Emergency stop cleared — gamepad re-enabled')
+                self.get_logger().info('✅ Emergency stop cleared — torque re-enabled, gamepad active')
                 return
             if self.last_buttons.get('select', 0): # Toggle Mode
                 self.mode = 1 if self.mode == 0 else 0
@@ -207,6 +233,10 @@ class JoystickController(Node):
             if pg.joystick.get_count() > 0:
                 self.joy = pg.joystick.Joystick(0)
                 self.joy.init()
+                # Reset calibration on new joystick connect
+                self.calibrated = False
+                self.calibration_samples = []
+                self.get_logger().info('🎮 Joystick connected — calibrating (hold sticks neutral)...')
             else:
                 return
 
@@ -218,24 +248,50 @@ class JoystickController(Node):
         raw_axes = [self.joy.get_axis(i) for i in range(num_axes)]
         raw_buttons = [float(self.joy.get_button(i)) for i in range(num_buttons)]
 
+        # ─── Auto-calibration: collect samples on first connect ────────────
+        if not self.calibrated:
+            if len(raw_axes) >= 4:
+                self.calibration_samples.append(raw_axes[:4])
+            if len(self.calibration_samples) >= 20:  # ~1 second at 20Hz
+                # Average the samples to find neutral offsets
+                samples = np.array(self.calibration_samples)
+                self.axis_offsets = samples.mean(axis=0).tolist()
+                self.calibrated = True
+                self.get_logger().info(
+                    f'✅ Calibration complete — offsets: '
+                    f'LX={self.axis_offsets[0]:.3f} LY={self.axis_offsets[1]:.3f} '
+                    f'RX={self.axis_offsets[2]:.3f} RY={self.axis_offsets[3]:.3f}'
+                )
+            # Don't process input during calibration
+            return
+
+        # Apply calibration offsets and clamp to [-1, 1]
+        cal_axes = []
+        for i in range(min(4, len(raw_axes))):
+            corrected = raw_axes[i] - self.axis_offsets[i]
+            corrected = max(-1.0, min(1.0, corrected))
+            cal_axes.append(corrected)
+        # Keep remaining axes (if any) untouched
+        cal_axes.extend(raw_axes[4:])
+
         # Read D-Pad hat (reports as hat, not buttons on ZD-V+)
         hat_x, hat_y = 0.0, 0.0
         if self.joy.get_numhats() > 0:
             hat_x, hat_y = self.joy.get_hat(0)  # (-1,0,1) for each axis
 
-        # Publish Joy message for dashboard visualizer
-        # axes[0-3] = sticks, axes[4] = hat_x (dpad L/R), axes[5] = hat_y (dpad U/D)
+        # Publish Joy message for dashboard visualizer (calibrated values)
+        # axes[0-3] = sticks (calibrated), axes[4] = hat_x (dpad L/R), axes[5] = hat_y (dpad U/D)
         joy_msg = Joy()
         joy_msg.header.stamp = self.get_clock().now().to_msg()
-        joy_msg.axes = raw_axes + [float(hat_x), float(hat_y)]
+        joy_msg.axes = cal_axes + [float(hat_x), float(hat_y)]
         joy_msg.buttons = [int(b) for b in raw_buttons]
         self.joy_pub.publish(joy_msg)
 
-        # Read first 4 axes for arm control
+        # Read first 4 calibrated axes for arm control
         try:
-            # Standard PS2 mapping: 0=LX, 1=LY, 2=RX, 3=RY
-            # Invert Y axes: -1 is UP in pygame but we want +pos for joint movement
-            axes = {'lx': raw_axes[0], 'ly': -raw_axes[1], 'rx': raw_axes[2], 'ry': -raw_axes[3]}
+            # Match original HiWonder AXES_MAP: axis0=LY, axis1=LX, axis2=RY, axis3=RX
+            # All axes negated (original does -self.joy.get_axis(i) for all)
+            axes = {'ly': -cal_axes[0], 'lx': -cal_axes[1], 'ry': -cal_axes[2], 'rx': -cal_axes[3]}
             self.axes_callback(axes)
         except:
             pass

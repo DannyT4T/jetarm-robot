@@ -1638,7 +1638,7 @@ function ModuleContent({ type, shared }: { type: ModuleType; shared: SharedState
                         if (saved) return JSON.parse(saved);
                     } catch { }
                 }
-                return { 1: { min: 0, max: 1000 }, 2: { min: 450, max: 1000 }, 3: { min: 0, max: 1000 }, 4: { min: 0, max: 1000 }, 5: { min: 0, max: 1000 }, 10: { min: 50, max: 600 } };
+                return { 1: { min: 0, max: 1000 }, 2: { min: 0, max: 1000 }, 3: { min: 0, max: 1000 }, 4: { min: 0, max: 1000 }, 5: { min: 0, max: 1000 }, 10: { min: 0, max: 1000 } };
             });
             const [constraintsSaved, setConstraintsSaved] = useState(true);
             const [constraintsLoading, setConstraintsLoading] = useState(false);
@@ -1747,7 +1747,7 @@ function ModuleContent({ type, shared }: { type: ModuleType; shared: SharedState
                                 {SERVO_NAMES.map((joint, idx) => {
                                     const servoId = SERVO_IDS[idx];
                                     const c = constraints[servoId] || { min: 0, max: 1000 };
-                                    const defaults: Record<number, { min: number, max: number }> = { 1: { min: 0, max: 1000 }, 2: { min: 450, max: 1000 }, 3: { min: 0, max: 1000 }, 4: { min: 0, max: 1000 }, 5: { min: 0, max: 1000 }, 10: { min: 50, max: 600 } };
+                                    const defaults: Record<number, { min: number, max: number }> = { 1: { min: 0, max: 1000 }, 2: { min: 0, max: 1000 }, 3: { min: 0, max: 1000 }, 4: { min: 0, max: 1000 }, 5: { min: 0, max: 1000 }, 10: { min: 0, max: 1000 } };
                                     const d = defaults[servoId] || { min: 0, max: 1000 };
                                     const isModified = c.min !== d.min || c.max !== d.max;
                                     return (
@@ -1777,7 +1777,7 @@ function ModuleContent({ type, shared }: { type: ModuleType; shared: SharedState
                                 <div className="flex items-center justify-between pt-2">
                                     <button
                                         onClick={() => {
-                                            const defaults: Record<number, { min: number, max: number }> = { 1: { min: 0, max: 1000 }, 2: { min: 450, max: 1000 }, 3: { min: 0, max: 1000 }, 4: { min: 0, max: 1000 }, 5: { min: 0, max: 1000 }, 10: { min: 50, max: 600 } };
+                                            const defaults: Record<number, { min: number, max: number }> = { 1: { min: 0, max: 1000 }, 2: { min: 0, max: 1000 }, 3: { min: 0, max: 1000 }, 4: { min: 0, max: 1000 }, 5: { min: 0, max: 1000 }, 10: { min: 0, max: 1000 } };
                                             setConstraints(defaults);
                                             setConstraintsSaved(false);
                                         }}

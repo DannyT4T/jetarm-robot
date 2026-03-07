@@ -42,11 +42,11 @@ SAFETY_LIMITS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 's
 # These are enforced BEFORE any command reaches the hardware
 DEFAULT_SAFETY_LIMITS = {
     1:  {'min': 0,   'max': 1000, 'name': 'Base rotation'},
-    2:  {'min': 450, 'max': 1000, 'name': 'Shoulder (⚠️ broken gear: min 450)'},
+    2:  {'min': 0,   'max': 1000, 'name': 'Shoulder'},
     3:  {'min': 0,   'max': 1000, 'name': 'Elbow'},
     4:  {'min': 0,   'max': 1000, 'name': 'Wrist pitch'},
     5:  {'min': 0,   'max': 1000, 'name': 'Wrist rotate'},
-    10: {'min': 50,  'max': 600,  'name': 'Gripper'},
+    10: {'min': 0,   'max': 1000, 'name': 'Gripper'},
 }
 
 # Max movement speed — limits duration to prevent jerky moves
