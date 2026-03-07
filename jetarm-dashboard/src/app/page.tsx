@@ -2195,6 +2195,7 @@ export default function Dashboard() {
     const [yoloCount, setYoloCount] = useState(0);
     const lastDebugRef = useRef<string>('');
     const estopLastRef = useRef<number>(0);
+    const [estopActive, setEstopActive] = useState(false);
 
     const shared: SharedState = {
         rosConnected, controllerActive, jointPos, gamepad,
@@ -2272,11 +2273,17 @@ export default function Dashboard() {
                 // 🛑 KILL SWITCH: SELECT button (index 8) triggers emergency stop
                 if (buttons[8] === 1 && Date.now() - estopLastRef.current > 1000) {
                     estopLastRef.current = Date.now();
+                    setEstopActive(true);
                     fetch(`http://${JETSON_IP}:8888`, {
                         method: 'POST',
                         headers: { 'Content-Type': 'application/json' },
                         body: JSON.stringify({ action: 'emergency_stop' }),
                     }).catch(() => { });
+                }
+
+                // ▶️ RESUME: START button (index 9) clears e-stop
+                if (buttons[9] === 1) {
+                    setEstopActive(false);
                 }
             });
 
@@ -2378,6 +2385,11 @@ export default function Dashboard() {
                 <div className="flex items-center space-x-4">
                     {/* Status badges */}
                     <div className="flex items-center space-x-2">
+                        {estopActive && (
+                            <div className="flex items-center space-x-1.5 px-3 py-1.5 bg-red-600/20 text-red-400 border border-red-500/40 rounded-full text-xs font-bold animate-pulse shadow-lg shadow-red-600/20">
+                                <span className="text-sm">🛑</span><span>E-STOP</span>
+                            </div>
+                        )}
                         {rosConnected ? (
                             <div className="flex items-center space-x-1.5 px-3 py-1.5 bg-emerald-500/10 text-emerald-400 border border-emerald-500/20 rounded-full text-xs font-semibold"><Wifi size={14} /><span>Live</span></div>
                         ) : rosBooting ? (
