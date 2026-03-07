@@ -217,7 +217,7 @@ class JoystickController(Node):
                 return
             if self.last_buttons.get('select', 0): # Toggle Mode
                 self.mode = 1 if self.mode == 0 else 0
-                self.buzzer_pub.set_buzzer(1000, 0.1, 0.5, self.mode + 1)
+                # Buzzer removed — dashboard indicator is sufficient
                 self.get_logger().info('Mode toggled to %d' % self.mode)
             else: # RESET ALL TO 500 (Start button only)
                 self.get_logger().info('Start Button: Centering all servos to 500')

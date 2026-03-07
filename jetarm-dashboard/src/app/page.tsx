@@ -2281,9 +2281,14 @@ export default function Dashboard() {
                     }).catch(() => { });
                 }
 
-                // ▶️ RESUME: START button (index 9) clears e-stop
-                if (buttons[9] === 1) {
+                // ▶️ RESUME: START button (index 9) clears e-stop and re-enables torque
+                if (buttons[9] === 1 && estopActive) {
                     setEstopActive(false);
+                    fetch(`http://${JETSON_IP}:8888`, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ action: 'resume' }),
+                    }).catch(() => { });
                 }
             });
 

@@ -25,6 +25,7 @@ from rclpy.callback_groups import ReentrantCallbackGroup
 
 from ros_robot_controller_msgs.msg import ServosPosition as BusServosPosition
 from ros_robot_controller_msgs.msg import ServoPosition as BusServoPosition
+from ros_robot_controller_msgs.msg import SetBusServoState, BusServoState
 from servo_controller_msgs.msg import ServosPosition, ServoPosition
 from ros_robot_controller_msgs.msg import BuzzerState
 from kinematics_msgs.srv import SetRobotPose, SetJointValue, GetRobotPose
@@ -199,6 +200,8 @@ class JetArmBridge(Node):
             ServosPosition, '/servo_controller', 10)
         self.buzzer_pub = self.create_publisher(
             BuzzerState, '/ros_robot_controller/set_buzzer', 10)
+        self.servo_state_pub = self.create_publisher(
+            SetBusServoState, '/ros_robot_controller/bus_servo/set_state', 10)
         
         # Kinematics service clients
         self.ik_client = self.create_client(
@@ -324,26 +327,34 @@ class BridgeHandler(BaseHTTPRequestHandler):
                 result = {'success': True, 'message': f'Home ({dur}ms)'}
 
             elif action == 'emergency_stop':
-                # EMERGENCY STOP: Read current positions and hold them with 0ms duration
-                # This instantly freezes all servos in their current position
-                current = node.get_servo_states()
-                positions = []
-                for sid in [1, 2, 3, 4, 5, 10]:
-                    if sid in current:
-                        positions.append({'id': sid, 'position': current[sid]['position']})
-                    else:
-                        positions.append({'id': sid, 'position': 500})
-                msg = BusServosPosition()
-                msg.duration = 0.0  # Instant — no interpolation
-                for p in positions:
-                    sp = BusServoPosition()
-                    sp.id = int(p['id'])
-                    sp.position = int(p['position'])
-                    msg.position.append(sp)
-                node.bus_servo_pub.publish(msg)
-                node.buzzer(2000, 0.1, 0.05, 2)  # Short beep to confirm
-                log_safety_event('ESTOP', 'Emergency stop triggered — all servos frozen')
-                result = {'success': True, 'message': '🛑 Emergency stop — all servos frozen'}
+                # TRUE EMERGENCY STOP: Kill torque on ALL servos — arm goes completely limp
+                # This is the safest approach: no movement, no torque, instant release.
+                # Critical for safety if hair/clothing/fingers are caught.
+                servo_ids = [1, 2, 3, 4, 5, 10]
+                for sid in servo_ids:
+                    msg = SetBusServoState()
+                    servo = BusServoState()
+                    servo.present_id = [1, sid]       # [flag=1, servo_id]
+                    servo.enable_torque = [1, 0]      # [flag=1, value=0 (torque OFF)]
+                    msg.state = [servo]
+                    msg.duration = 0.0
+                    node.servo_state_pub.publish(msg)
+                log_safety_event('ESTOP', 'Emergency stop — ALL servo torque killed, arm is limp')
+                result = {'success': True, 'message': '🛑 Emergency stop — all servo torque killed'}
+
+            elif action == 'resume':
+                # Resume from E-STOP: Re-enable torque on all servos
+                servo_ids = [1, 2, 3, 4, 5, 10]
+                for sid in servo_ids:
+                    msg = SetBusServoState()
+                    servo = BusServoState()
+                    servo.present_id = [1, sid]
+                    servo.enable_torque = [1, 1]      # [flag=1, value=1 (torque ON)]
+                    msg.state = [servo]
+                    msg.duration = 0.0
+                    node.servo_state_pub.publish(msg)
+                log_safety_event('RESUME', 'Torque re-enabled on all servos')
+                result = {'success': True, 'message': '✅ Torque re-enabled — servos active'}
 
             elif action == 'read_servos':
                 result = {'success': True, 'servos': node.get_servo_states()}
