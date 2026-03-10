@@ -1728,8 +1728,10 @@ function EpisodeGalleryWidget() {
                 fetch('/api/training?action=list_episodes'),
                 fetch('/api/training?action=episode_stats'),
             ]);
-            setEpisodes(await epsRes.json());
-            setStats(await statsRes.json());
+            const epsData = await epsRes.json();
+            setEpisodes(Array.isArray(epsData) ? epsData : []);
+            const statsData = await statsRes.json();
+            setStats(statsData && typeof statsData === 'object' ? statsData : {});
         } catch { /* offline */ }
     };
 
@@ -1845,8 +1847,8 @@ function TrainingControlsWidget() {
             <div className="flex items-center justify-between">
                 <span className="text-sm font-semibold text-white">SmolVLA Fine-tuning</span>
                 <span className={`px-2 py-0.5 rounded-full text-xs font-semibold ${status === 'running' ? 'bg-emerald-500/20 text-emerald-400' :
-                        status === 'complete' ? 'bg-blue-500/20 text-blue-400' :
-                            'bg-slate-700 text-slate-400'
+                    status === 'complete' ? 'bg-blue-500/20 text-blue-400' :
+                        'bg-slate-700 text-slate-400'
                     }`}>{status}</span>
             </div>
 
@@ -1993,8 +1995,10 @@ function ModelManagerWidget() {
                 fetch('/api/training?action=list_models'),
                 fetch('/api/training?action=inference_status'),
             ]);
-            setModels(await modelsRes.json());
-            setInferenceStatus(await infRes.json());
+            const modelsData = await modelsRes.json();
+            setModels(Array.isArray(modelsData) ? modelsData : []);
+            const infData = await infRes.json();
+            setInferenceStatus(infData && typeof infData === 'object' ? infData : {});
         } catch { /* offline */ }
     };
 
@@ -2122,8 +2126,8 @@ function SmolVLAInferenceWidget() {
             <div className="flex items-center justify-between">
                 <div className="flex items-center space-x-2">
                     <div className={`w-3 h-3 rounded-full ${state.status === 'running' ? 'bg-emerald-500 animate-pulse' :
-                            state.status === 'loading' ? 'bg-amber-500 animate-pulse' :
-                                state.status === 'error' ? 'bg-red-500' : 'bg-slate-600'
+                        state.status === 'loading' ? 'bg-amber-500 animate-pulse' :
+                            state.status === 'error' ? 'bg-red-500' : 'bg-slate-600'
                         }`} />
                     <span className={`text-sm font-semibold ${statusColors[state.status] || 'text-slate-400'}`}>
                         {state.status?.toUpperCase()}

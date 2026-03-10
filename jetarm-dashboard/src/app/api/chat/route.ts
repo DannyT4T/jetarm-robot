@@ -6,7 +6,8 @@ const ollama = createOllama({ baseURL: 'http://localhost:11434' });
 const AI_API = 'http://localhost:3000/api/ai';
 const BRIDGE_URL = 'http://192.168.1.246:8888';
 const CAMERA_SNAPSHOT = 'http://192.168.1.246:8080/snapshot?topic=/depth_cam/color/image_raw';
-const VISION_MODEL = 'minicpm-v';
+// Single unified model: Qwen 3.5 handles text + vision + tools + thinking
+const UNIFIED_MODEL = 'qwen3.5:9b';
 
 const BASE_PROMPT = `You are JetArm AI — the intelligent brain of a HiWonder JetArm 5-DOF robotic arm. You are fast, responsive, and move with purpose.
 
@@ -101,7 +102,7 @@ export async function POST(req: Request) {
         const systemPrompt = BASE_PROMPT + servoContext + visionContext;
 
         const result = streamText({
-            model: ollama('qwen2.5:7b'),
+            model: ollama(UNIFIED_MODEL),
             system: systemPrompt,
             messages: modelMessages,
             tools: {
@@ -198,12 +199,12 @@ export async function POST(req: Request) {
 
                             const visionContext = `You are the eyes of a HiWonder JetArm 5-DOF robotic arm looking through an Orbbec depth camera. Your workspace is a table/desk in front of you. Focus on objects the robot could interact with — their colors, sizes, positions (left/right/center, near/far). Keep your description practical and concise (2-4 sentences).`;
 
-                            // Send to MiniCPM-V vision model
+                            // Use the SAME Qwen2.5-VL model for vision — no separate model needed!
                             const visionRes = await fetch('http://localhost:11434/api/chat', {
                                 method: 'POST',
                                 headers: { 'Content-Type': 'application/json' },
                                 body: JSON.stringify({
-                                    model: VISION_MODEL,
+                                    model: UNIFIED_MODEL,
                                     messages: [
                                         { role: 'system', content: visionContext },
                                         { role: 'user', content: question || 'What do you see?', images: [imgBase64] },
@@ -213,7 +214,6 @@ export async function POST(req: Request) {
                                 signal: AbortSignal.timeout(30000),
                             });
                             const visionData = await visionRes.json();
-                            // Only return text description (no base64!) — Qwen can't process images
                             return {
                                 success: true,
                                 description: visionData.message?.content || 'Could not analyze image',
