@@ -14,13 +14,15 @@ import {
 
 const JETSON_IP = "192.168.1.246";
 const STORAGE_KEY = "jetarm-dashboard-layout";
-const LAYOUT_VERSION = 10; // Bump this when default system tabs change
+const LAYOUT_VERSION = 11; // Bump this when default system tabs change
 
 // ─── Types ───────────────────────────────────────────────────────────────────
 type ModuleType = 'rgb_feed' | 'depth_feed' | 'gamepad_visualizer' | 'telemetry' | 'control_scheme' | 'system_controls'
     | 'ai_detection_feed' | 'ai_detections_log' | 'ai_controls' | 'ai_chat' | 'voice_assistant'
     | 'vision_v2_controls' | 'vision_v2_state' | 'autonomy'
-    | 'overhead_feed' | 'overhead_detection_feed';
+    | 'overhead_feed' | 'overhead_detection_feed'
+    | 'episode_recorder' | 'episode_gallery' | 'training_controls'
+    | 'training_progress' | 'model_manager' | 'smolvla_inference';
 
 interface YoloDetection {
     class: string; confidence: number;
@@ -66,6 +68,12 @@ const MODULE_REGISTRY: Record<ModuleType, { name: string; icon: string; desc: st
     autonomy: { name: 'Autonomy', icon: '🤖', desc: 'Autonomous sense→think→act loop' },
     overhead_feed: { name: 'Overhead Camera', icon: '🎥', desc: 'Third-person USB webcam — raw feed' },
     overhead_detection_feed: { name: 'Overhead Detections', icon: '🔭', desc: 'Third-person webcam with YOLO overlay' },
+    episode_recorder: { name: 'Episode Recorder', icon: '🎬', desc: 'Record joystick demos as training episodes' },
+    episode_gallery: { name: 'Episode Gallery', icon: '📚', desc: 'Browse, replay, and manage recorded episodes' },
+    training_controls: { name: 'Training Controls', icon: '🧠', desc: 'Start/stop SmolVLA fine-tuning on Mac' },
+    training_progress: { name: 'Training Progress', icon: '📈', desc: 'Live training loss chart, epoch & ETA' },
+    model_manager: { name: 'Model Manager', icon: '📦', desc: 'Model versions, deploy to Jetson, rollback' },
+    smolvla_inference: { name: 'SmolVLA Live', icon: '🤖', desc: 'Run SmolVLA autonomously — real-time actions' },
 };
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
@@ -110,6 +118,33 @@ const defaultLayout: DashboardLayout = {
                 { id: uid(), type: 'rgb_feed' },
                 { id: uid(), type: 'depth_feed' },
                 { id: uid(), type: 'telemetry' },
+            ]
+        },
+        {
+            id: 'teach', name: '🎮 Teach', isSystem: true, modules: [
+                { id: uid(), type: 'episode_recorder' },
+                { id: uid(), type: 'rgb_feed' },
+                { id: uid(), type: 'overhead_feed' },
+                { id: uid(), type: 'gamepad_visualizer' },
+                { id: uid(), type: 'telemetry' },
+                { id: uid(), type: 'episode_gallery' },
+            ]
+        },
+        {
+            id: 'train', name: '🧠 Train', isSystem: true, modules: [
+                { id: uid(), type: 'training_controls' },
+                { id: uid(), type: 'training_progress' },
+                { id: uid(), type: 'episode_gallery' },
+                { id: uid(), type: 'model_manager' },
+            ]
+        },
+        {
+            id: 'smolvla', name: '🤖 SmolVLA', isSystem: true, modules: [
+                { id: uid(), type: 'smolvla_inference' },
+                { id: uid(), type: 'rgb_feed' },
+                { id: uid(), type: 'overhead_feed' },
+                { id: uid(), type: 'telemetry' },
+                { id: uid(), type: 'model_manager' },
             ]
         },
     ],
@@ -1557,6 +1592,624 @@ function VisionV2StateWidget() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
+// SMOLVLA TRAINING WIDGETS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+function EpisodeRecorderWidget() {
+    const [status, setStatus] = useState<'idle' | 'recording' | 'saving'>('idle');
+    const [task, setTask] = useState('pick_object');
+    const [frames, setFrames] = useState(0);
+    const [elapsed, setElapsed] = useState(0);
+    const [fps, setFps] = useState(0);
+    const [totalEps, setTotalEps] = useState(0);
+    const [cameras, setCameras] = useState<string[]>([]);
+    const [msg, setMsg] = useState('');
+
+    useEffect(() => {
+        const poll = setInterval(async () => {
+            try {
+                const res = await fetch('/api/training?action=recording_status');
+                const d = await res.json();
+                setStatus(d.status || 'idle');
+                setFrames(d.frame_count || 0);
+                setElapsed(d.elapsed || 0);
+                setFps(d.fps || 0);
+                setTotalEps(d.total_episodes || 0);
+                setCameras(d.cameras_available || []);
+            } catch { /* offline */ }
+        }, 1000);
+        return () => clearInterval(poll);
+    }, []);
+
+    const startRec = async () => {
+        setMsg('');
+        const res = await fetch('/api/training', {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ action: 'start_recording', task }),
+        });
+        const d = await res.json();
+        setMsg(d.message || d.error || '');
+    };
+
+    const stopRec = async () => {
+        const res = await fetch('/api/training', {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ action: 'stop_recording' }),
+        });
+        const d = await res.json();
+        setMsg(d.frames ? `✅ Saved! ${d.frames} frames, ${d.duration}s` : d.error || '');
+    };
+
+    const discard = async () => {
+        const res = await fetch('/api/training', {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ action: 'discard_recording' }),
+        });
+        const d = await res.json();
+        setMsg(d.message || '');
+    };
+
+    const statusColors: Record<string, string> = {
+        idle: 'bg-slate-600', recording: 'bg-red-500 animate-pulse', saving: 'bg-amber-500 animate-pulse',
+    };
+
+    return (
+        <div className="space-y-4">
+            <div className="flex items-center justify-between">
+                <div className="flex items-center space-x-2">
+                    <div className={`w-3 h-3 rounded-full ${statusColors[status]}`} />
+                    <span className="text-sm font-semibold text-white uppercase">{status}</span>
+                </div>
+                <span className="text-xs text-slate-400">📚 {totalEps} episodes total</span>
+            </div>
+
+            <div className="flex items-center space-x-2">
+                <label className="text-xs text-slate-400">Task:</label>
+                <select value={task} onChange={e => setTask(e.target.value)}
+                    className="flex-1 bg-slate-800 border border-slate-700 rounded-lg px-3 py-1.5 text-sm text-white">
+                    <option value="pick_object">Pick Object</option>
+                    <option value="stack_blocks">Stack Blocks</option>
+                    <option value="sort_colors">Sort Colors</option>
+                    <option value="place_target">Place on Target</option>
+                    <option value="custom">Custom</option>
+                </select>
+            </div>
+
+            {status === 'recording' && (
+                <div className="bg-red-500/10 border border-red-500/30 rounded-xl p-3 space-y-1">
+                    <div className="flex justify-between text-sm">
+                        <span className="text-red-300">⏺ Recording</span>
+                        <span className="text-white font-mono">{elapsed.toFixed(1)}s</span>
+                    </div>
+                    <div className="flex justify-between text-xs text-slate-400">
+                        <span>Frames: {frames}</span>
+                        <span>FPS: {fps.toFixed(1)}</span>
+                    </div>
+                </div>
+            )}
+
+            <div className="flex space-x-2">
+                {status === 'idle' ? (
+                    <button onClick={startRec} className="flex-1 px-4 py-2.5 bg-red-600 hover:bg-red-500 text-white rounded-xl text-sm font-semibold transition-colors">
+                        ▶ Start Recording
+                    </button>
+                ) : (
+                    <>
+                        <button onClick={stopRec} className="flex-1 px-4 py-2.5 bg-emerald-600 hover:bg-emerald-500 text-white rounded-xl text-sm font-semibold transition-colors">
+                            ⏹ Save Episode
+                        </button>
+                        <button onClick={discard} className="px-4 py-2.5 bg-slate-700 hover:bg-slate-600 text-white rounded-xl text-sm font-semibold transition-colors">
+                            🗑
+                        </button>
+                    </>
+                )}
+            </div>
+
+            {cameras.length > 0 && (
+                <div className="text-xs text-slate-500">
+                    📷 {cameras.join(' • ')}
+                </div>
+            )}
+
+            {msg && <p className="text-xs text-slate-300 bg-slate-800 rounded-lg px-3 py-2">{msg}</p>}
+        </div>
+    );
+}
+
+function EpisodeGalleryWidget() {
+    const [episodes, setEpisodes] = useState<any[]>([]);
+    const [stats, setStats] = useState<any>({});
+    const [syncing, setSyncing] = useState(false);
+    const [msg, setMsg] = useState('');
+
+    const loadEpisodes = async () => {
+        try {
+            const [epsRes, statsRes] = await Promise.all([
+                fetch('/api/training?action=list_episodes'),
+                fetch('/api/training?action=episode_stats'),
+            ]);
+            setEpisodes(await epsRes.json());
+            setStats(await statsRes.json());
+        } catch { /* offline */ }
+    };
+
+    useEffect(() => { loadEpisodes(); const iv = setInterval(loadEpisodes, 10000); return () => clearInterval(iv); }, []);
+
+    const deleteEp = async (id: number) => {
+        await fetch('/api/training', {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ action: 'delete_episode', episode_id: id }),
+        });
+        loadEpisodes();
+    };
+
+    const syncToMac = async () => {
+        setSyncing(true); setMsg('Syncing...');
+        const res = await fetch('/api/training', {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ action: 'sync_to_mac' }),
+        });
+        const d = await res.json();
+        setMsg(d.message || ''); setSyncing(false);
+    };
+
+    return (
+        <div className="space-y-3">
+            <div className="flex items-center justify-between">
+                <span className="text-sm text-slate-300">{episodes.length} episodes • {stats.disk_usage_mb || 0} MB</span>
+                <button onClick={syncToMac} disabled={syncing}
+                    className="px-3 py-1.5 bg-blue-600 hover:bg-blue-500 disabled:opacity-50 text-white rounded-lg text-xs font-semibold transition-colors">
+                    {syncing ? '🔄 Syncing...' : '🔄 Sync to Mac'}
+                </button>
+            </div>
+
+            {stats.tasks && Object.keys(stats.tasks).length > 0 && (
+                <div className="flex flex-wrap gap-1.5">
+                    {Object.entries(stats.tasks as Record<string, number>).map(([task, count]) => (
+                        <span key={task} className="px-2 py-0.5 bg-slate-800 text-slate-300 rounded-full text-xs">
+                            {task}: {count}
+                        </span>
+                    ))}
+                </div>
+            )}
+
+            <div className="grid grid-cols-4 gap-2 max-h-60 overflow-y-auto">
+                {episodes.slice(0, 20).map((ep: any) => (
+                    <div key={ep.episode_id} className="bg-slate-800/50 border border-slate-700 rounded-lg p-2 text-center group relative">
+                        <div className="w-full aspect-square bg-slate-900 rounded mb-1 flex items-center justify-center text-2xl">
+                            {ep.has_thumbnail ? (
+                                <img src={`/api/training?action=episode_thumbnail&id=${ep.episode_id}`}
+                                    className="w-full h-full object-cover rounded" alt="" />
+                            ) : '📷'}
+                        </div>
+                        <div className="text-[10px] text-slate-400">#{String(ep.episode_id).slice(-4)}</div>
+                        <div className="text-[10px] text-slate-500">{ep.duration_s}s • {ep.num_frames}f</div>
+                        <div className="text-[10px] text-blue-400">{ep.task}</div>
+                        <button onClick={() => deleteEp(ep.episode_id)}
+                            className="absolute top-1 right-1 w-5 h-5 bg-red-600/80 rounded-full text-white text-[10px] opacity-0 group-hover:opacity-100 transition-opacity">×</button>
+                    </div>
+                ))}
+            </div>
+
+            {episodes.length === 0 && (
+                <div className="text-center py-8 text-slate-600">
+                    <span className="text-3xl">📚</span>
+                    <p className="mt-2 text-sm">No episodes yet — go to Teach tab to record</p>
+                </div>
+            )}
+
+            {msg && <p className="text-xs text-slate-300 bg-slate-800 rounded-lg px-3 py-2">{msg}</p>}
+        </div>
+    );
+}
+
+function TrainingControlsWidget() {
+    const [epochs, setEpochs] = useState(50);
+    const [batchSize, setBatchSize] = useState(8);
+    const [lr, setLr] = useState(0.0001);
+    const [status, setStatus] = useState('idle');
+    const [msg, setMsg] = useState('');
+
+    useEffect(() => {
+        const poll = setInterval(async () => {
+            try {
+                const res = await fetch('/api/training?action=training_status');
+                const d = await res.json();
+                setStatus(d.status || 'idle');
+            } catch { /* offline */ }
+        }, 3000);
+        return () => clearInterval(poll);
+    }, []);
+
+    const startTraining = async () => {
+        setMsg('Starting training...');
+        const res = await fetch('/api/training', {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ action: 'start_training', config: { epochs, batchSize, lr } }),
+        });
+        const d = await res.json();
+        setMsg(d.message || d.error || '');
+    };
+
+    const stopTraining = async () => {
+        const res = await fetch('/api/training', {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ action: 'stop_training' }),
+        });
+        const d = await res.json();
+        setMsg(d.message || '');
+    };
+
+    return (
+        <div className="space-y-4">
+            <div className="flex items-center justify-between">
+                <span className="text-sm font-semibold text-white">SmolVLA Fine-tuning</span>
+                <span className={`px-2 py-0.5 rounded-full text-xs font-semibold ${status === 'running' ? 'bg-emerald-500/20 text-emerald-400' :
+                        status === 'complete' ? 'bg-blue-500/20 text-blue-400' :
+                            'bg-slate-700 text-slate-400'
+                    }`}>{status}</span>
+            </div>
+
+            <div className="grid grid-cols-3 gap-2">
+                <div>
+                    <label className="text-[10px] text-slate-500 block mb-1">Epochs</label>
+                    <input type="number" value={epochs} onChange={e => setEpochs(+e.target.value)}
+                        className="w-full bg-slate-800 border border-slate-700 rounded-lg px-2 py-1.5 text-sm text-white" />
+                </div>
+                <div>
+                    <label className="text-[10px] text-slate-500 block mb-1">Batch Size</label>
+                    <input type="number" value={batchSize} onChange={e => setBatchSize(+e.target.value)}
+                        className="w-full bg-slate-800 border border-slate-700 rounded-lg px-2 py-1.5 text-sm text-white" />
+                </div>
+                <div>
+                    <label className="text-[10px] text-slate-500 block mb-1">Learn Rate</label>
+                    <input type="number" value={lr} step={0.00001} onChange={e => setLr(+e.target.value)}
+                        className="w-full bg-slate-800 border border-slate-700 rounded-lg px-2 py-1.5 text-sm text-white" />
+                </div>
+            </div>
+
+            <div className="text-xs text-slate-500 bg-slate-800/50 rounded-lg px-3 py-2">
+                Device: Mac Mini M4 (Apple MPS) • Base: SmolVLA 450M
+            </div>
+
+            {status === 'running' ? (
+                <button onClick={stopTraining} className="w-full px-4 py-2.5 bg-red-600 hover:bg-red-500 text-white rounded-xl text-sm font-semibold transition-colors">
+                    ⏹ Stop Training
+                </button>
+            ) : (
+                <button onClick={startTraining} className="w-full px-4 py-2.5 bg-emerald-600 hover:bg-emerald-500 text-white rounded-xl text-sm font-semibold transition-colors">
+                    🚀 Start Training
+                </button>
+            )}
+
+            {msg && <p className="text-xs text-slate-300 bg-slate-800 rounded-lg px-3 py-2">{msg}</p>}
+        </div>
+    );
+}
+
+function TrainingProgressWidget() {
+    const [state, setState] = useState<any>({ status: 'idle' });
+
+    useEffect(() => {
+        const poll = setInterval(async () => {
+            try {
+                const res = await fetch('/api/training?action=training_status');
+                setState(await res.json());
+            } catch { /* offline */ }
+        }, 2000);
+        return () => clearInterval(poll);
+    }, []);
+
+    const pct = state.totalEpochs > 0 ? (state.epoch / state.totalEpochs) * 100 : 0;
+    const history = state.lossHistory || [];
+
+    return (
+        <div className="space-y-4">
+            {state.status === 'idle' && (
+                <div className="text-center py-8 text-slate-600">
+                    <span className="text-3xl">📈</span>
+                    <p className="mt-2 text-sm">No training in progress</p>
+                    <p className="text-xs text-slate-500 mt-1">Go to Training Controls to start</p>
+                </div>
+            )}
+
+            {state.status === 'running' && (
+                <>
+                    {/* Progress bar */}
+                    <div>
+                        <div className="flex justify-between text-xs text-slate-400 mb-1">
+                            <span>Epoch {state.epoch}/{state.totalEpochs}</span>
+                            <span>{pct.toFixed(0)}%</span>
+                        </div>
+                        <div className="w-full bg-slate-800 rounded-full h-3">
+                            <div className="bg-gradient-to-r from-blue-500 to-emerald-400 h-3 rounded-full transition-all duration-500"
+                                style={{ width: `${pct}%` }} />
+                        </div>
+                        <div className="text-xs text-slate-500 mt-1">ETA: {state.eta || '...'}</div>
+                    </div>
+
+                    {/* Loss chart (simple bar representation) */}
+                    {history.length > 0 && (
+                        <div>
+                            <div className="text-xs text-slate-400 mb-1">Loss History</div>
+                            <div className="flex items-end space-x-px h-20 bg-slate-800/50 rounded-lg p-2">
+                                {history.slice(-40).map((loss: number, i: number) => {
+                                    const maxLoss = Math.max(...history.slice(-40));
+                                    const h = maxLoss > 0 ? (loss / maxLoss) * 100 : 0;
+                                    return (
+                                        <div key={i} className="flex-1 bg-blue-500/60 rounded-t-sm min-h-[2px] transition-all"
+                                            style={{ height: `${h}%` }} />
+                                    );
+                                })}
+                            </div>
+                        </div>
+                    )}
+
+                    {/* Metrics */}
+                    <div className="grid grid-cols-3 gap-2 text-center">
+                        <div className="bg-slate-800/50 rounded-lg p-2">
+                            <div className="text-lg font-bold text-white">{state.loss?.toFixed(4) || '—'}</div>
+                            <div className="text-[10px] text-slate-500">Current Loss</div>
+                        </div>
+                        <div className="bg-slate-800/50 rounded-lg p-2">
+                            <div className="text-lg font-bold text-emerald-400">{state.bestLoss < Infinity ? state.bestLoss?.toFixed(4) : '—'}</div>
+                            <div className="text-[10px] text-slate-500">Best Loss</div>
+                        </div>
+                        <div className="bg-slate-800/50 rounded-lg p-2">
+                            <div className="text-lg font-bold text-blue-400">{state.lr?.toExponential(1) || '—'}</div>
+                            <div className="text-[10px] text-slate-500">Learn Rate</div>
+                        </div>
+                    </div>
+                </>
+            )}
+
+            {state.status === 'complete' && (
+                <div className="text-center py-6">
+                    <span className="text-4xl">🎉</span>
+                    <p className="text-white font-semibold mt-2">Training Complete!</p>
+                    <p className="text-sm text-slate-400 mt-1">Best loss: {state.bestLoss?.toFixed(4)}</p>
+                    <p className="text-xs text-slate-500 mt-1">Deploy model from Model Manager</p>
+                </div>
+            )}
+
+            {state.status === 'error' && (
+                <div className="bg-red-500/10 border border-red-500/30 rounded-lg p-3 text-sm text-red-300">
+                    ⚠️ {state.error}
+                </div>
+            )}
+        </div>
+    );
+}
+
+function ModelManagerWidget() {
+    const [models, setModels] = useState<any[]>([]);
+    const [inferenceStatus, setInferenceStatus] = useState<any>({});
+    const [msg, setMsg] = useState('');
+    const [deploying, setDeploying] = useState(false);
+
+    const loadData = async () => {
+        try {
+            const [modelsRes, infRes] = await Promise.all([
+                fetch('/api/training?action=list_models'),
+                fetch('/api/training?action=inference_status'),
+            ]);
+            setModels(await modelsRes.json());
+            setInferenceStatus(await infRes.json());
+        } catch { /* offline */ }
+    };
+
+    useEffect(() => { loadData(); const iv = setInterval(loadData, 5000); return () => clearInterval(iv); }, []);
+
+    const deployModel = async (version: string) => {
+        setDeploying(true); setMsg(`Deploying ${version}...`);
+        const res = await fetch('/api/training', {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ action: 'deploy_model', version }),
+        });
+        const d = await res.json();
+        setMsg(d.message || d.error || ''); setDeploying(false);
+        loadData();
+    };
+
+    const loadModel = async (model: string) => {
+        setMsg(`Loading ${model}...`);
+        const res = await fetch('/api/training', {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ action: 'load_model', model }),
+        });
+        const d = await res.json();
+        setMsg(d.success ? `✅ Loaded! GPU: ${d.gpu_memory_gb} GB` : d.error || 'Failed');
+        loadData();
+    };
+
+    return (
+        <div className="space-y-3">
+            <div className="flex items-center justify-between">
+                <span className="text-sm font-semibold text-white">Model Versions</span>
+                {inferenceStatus.gpu_memory_gb > 0 && (
+                    <span className="text-xs text-emerald-400">
+                        GPU: {inferenceStatus.gpu_memory_gb}/{inferenceStatus.gpu_total_gb} GB
+                    </span>
+                )}
+            </div>
+
+            <div className="space-y-2 max-h-52 overflow-y-auto">
+                {models.map((m: any) => (
+                    <div key={m.version} className={`flex items-center justify-between bg-slate-800/50 border rounded-lg px-3 py-2 ${inferenceStatus.model_version === m.version ? 'border-emerald-500/50' : 'border-slate-700'
+                        }`}>
+                        <div>
+                            <div className="text-sm text-white flex items-center space-x-2">
+                                <span>{m.version}</span>
+                                {inferenceStatus.model_version === m.version && (
+                                    <span className="px-1.5 py-0.5 bg-emerald-500/20 text-emerald-400 rounded text-[10px] font-bold">ACTIVE</span>
+                                )}
+                            </div>
+                            <div className="text-[10px] text-slate-500">
+                                {m.source} {m.loss ? `• loss: ${m.loss.toFixed(4)}` : ''} {m.episodes ? `• ${m.episodes} eps` : ''}
+                            </div>
+                        </div>
+                        <div className="flex space-x-1.5">
+                            {m.source === 'local' && (
+                                <button onClick={() => deployModel(m.version)} disabled={deploying}
+                                    className="px-2 py-1 bg-blue-600/80 hover:bg-blue-500 text-white rounded text-[10px] font-semibold transition-colors">
+                                    Deploy
+                                </button>
+                            )}
+                            <button onClick={() => loadModel(m.name)} disabled={deploying}
+                                className="px-2 py-1 bg-slate-700 hover:bg-slate-600 text-white rounded text-[10px] font-semibold transition-colors">
+                                Load
+                            </button>
+                        </div>
+                    </div>
+                ))}
+            </div>
+
+            {models.length === 0 && (
+                <div className="text-center py-6 text-slate-600">
+                    <span className="text-2xl">📦</span>
+                    <p className="text-xs mt-1">No models found</p>
+                </div>
+            )}
+
+            {msg && <p className="text-xs text-slate-300 bg-slate-800 rounded-lg px-3 py-2">{msg}</p>}
+        </div>
+    );
+}
+
+function SmolVLAInferenceWidget() {
+    const [state, setState] = useState<any>({ status: 'idle' });
+    const [task, setTask] = useState('pick_object');
+    const [msg, setMsg] = useState('');
+
+    useEffect(() => {
+        const poll = setInterval(async () => {
+            try {
+                const res = await fetch('/api/training?action=inference_status');
+                setState(await res.json());
+            } catch { /* offline */ }
+        }, 1000);
+        return () => clearInterval(poll);
+    }, []);
+
+    const startInference = async () => {
+        setMsg('Starting...');
+        const res = await fetch('/api/training', {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ action: 'start_inference', task }),
+        });
+        const d = await res.json();
+        setMsg(d.message || d.error || '');
+    };
+
+    const stopInference = async () => {
+        const res = await fetch('/api/training', {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ action: 'stop_inference' }),
+        });
+        const d = await res.json();
+        setMsg(d.message || '');
+    };
+
+    const statusColors: Record<string, string> = {
+        idle: 'text-slate-400', loading: 'text-amber-400 animate-pulse',
+        running: 'text-emerald-400 animate-pulse', error: 'text-red-400',
+    };
+
+    const joints = ['Base', 'Shoulder', 'Elbow', 'Wrist', 'Rotate', 'Grip'];
+
+    return (
+        <div className="space-y-4">
+            <div className="flex items-center justify-between">
+                <div className="flex items-center space-x-2">
+                    <div className={`w-3 h-3 rounded-full ${state.status === 'running' ? 'bg-emerald-500 animate-pulse' :
+                            state.status === 'loading' ? 'bg-amber-500 animate-pulse' :
+                                state.status === 'error' ? 'bg-red-500' : 'bg-slate-600'
+                        }`} />
+                    <span className={`text-sm font-semibold ${statusColors[state.status] || 'text-slate-400'}`}>
+                        {state.status?.toUpperCase()}
+                    </span>
+                </div>
+                {state.status === 'running' && (
+                    <span className="text-xs text-emerald-400 font-mono">{state.fps} Hz</span>
+                )}
+            </div>
+
+            {state.status === 'running' && (
+                <>
+                    <div className="bg-slate-800/50 rounded-xl p-3 space-y-1.5">
+                        <div className="text-xs text-slate-400 mb-2">Predicted Actions</div>
+                        {state.last_action?.map((val: number, i: number) => {
+                            const current = state.last_state?.[i] || 500;
+                            const delta = val - current;
+                            return (
+                                <div key={i} className="flex items-center justify-between text-xs">
+                                    <span className="text-slate-500 w-16">{joints[i]}</span>
+                                    <span className="text-white font-mono">{current}</span>
+                                    <span className="text-slate-600">→</span>
+                                    <span className="text-blue-300 font-mono">{val}</span>
+                                    <span className={`font-mono w-12 text-right ${delta > 0 ? 'text-emerald-400' : delta < 0 ? 'text-red-400' : 'text-slate-600'}`}>
+                                        {delta > 0 ? '+' : ''}{delta}
+                                    </span>
+                                </div>
+                            );
+                        })}
+                    </div>
+
+                    <div className="grid grid-cols-3 gap-2 text-center">
+                        <div className="bg-slate-800/50 rounded-lg p-2">
+                            <div className="text-base font-bold text-white">{state.inference_ms}ms</div>
+                            <div className="text-[10px] text-slate-500">Inference</div>
+                        </div>
+                        <div className="bg-slate-800/50 rounded-lg p-2">
+                            <div className="text-base font-bold text-white">{state.total_steps}</div>
+                            <div className="text-[10px] text-slate-500">Steps</div>
+                        </div>
+                        <div className="bg-slate-800/50 rounded-lg p-2">
+                            <div className="text-base font-bold text-white">{state.gpu_memory_gb} GB</div>
+                            <div className="text-[10px] text-slate-500">GPU</div>
+                        </div>
+                    </div>
+                </>
+            )}
+
+            {state.status !== 'running' && (
+                <div className="flex items-center space-x-2">
+                    <label className="text-xs text-slate-400">Task:</label>
+                    <select value={task} onChange={e => setTask(e.target.value)}
+                        className="flex-1 bg-slate-800 border border-slate-700 rounded-lg px-3 py-1.5 text-sm text-white">
+                        <option value="pick_object">Pick Object</option>
+                        <option value="stack_blocks">Stack Blocks</option>
+                        <option value="sort_colors">Sort Colors</option>
+                        <option value="place_target">Place on Target</option>
+                    </select>
+                </div>
+            )}
+
+            <div className="flex space-x-2">
+                {state.status === 'running' ? (
+                    <button onClick={stopInference} className="flex-1 px-4 py-2.5 bg-red-600 hover:bg-red-500 text-white rounded-xl text-sm font-semibold transition-colors">
+                        ⏹ Stop
+                    </button>
+                ) : (
+                    <button onClick={startInference} disabled={state.status === 'loading'}
+                        className="flex-1 px-4 py-2.5 bg-emerald-600 hover:bg-emerald-500 disabled:opacity-50 text-white rounded-xl text-sm font-semibold transition-colors">
+                        ▶ Start Autonomous
+                    </button>
+                )}
+            </div>
+
+            {state.error && (
+                <div className="bg-red-500/10 border border-red-500/30 rounded-lg p-2 text-xs text-red-300">
+                    ⚠️ {state.error}
+                </div>
+            )}
+
+            {msg && <p className="text-xs text-slate-300 bg-slate-800 rounded-lg px-3 py-2">{msg}</p>}
+        </div>
+    );
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
 // MODULE RENDERER (dispatches to correct widget)
 // ═══════════════════════════════════════════════════════════════════════════════
 function ModuleContent({ type, shared }: { type: ModuleType; shared: SharedState }) {
@@ -1942,6 +2595,18 @@ function ModuleContent({ type, shared }: { type: ModuleType; shared: SharedState
             return <OverheadCameraWidget mode="raw" />;
         case 'overhead_detection_feed':
             return <OverheadCameraWidget mode="annotated" />;
+        case 'episode_recorder':
+            return <EpisodeRecorderWidget />;
+        case 'episode_gallery':
+            return <EpisodeGalleryWidget />;
+        case 'training_controls':
+            return <TrainingControlsWidget />;
+        case 'training_progress':
+            return <TrainingProgressWidget />;
+        case 'model_manager':
+            return <ModelManagerWidget />;
+        case 'smolvla_inference':
+            return <SmolVLAInferenceWidget />;
     }
 }
 
